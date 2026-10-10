@@ -17,6 +17,7 @@ endif
 
 layer_sources = files(
   'src/layer.c',
+  'src/util.c',
 )
 
 layer = shared_library('VkLayer_framepace',
