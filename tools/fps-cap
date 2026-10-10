@@ -1,38 +1,53 @@
 #!/usr/bin/env python3
-"""fps-cap: live fps cap for games running through the framepace Vulkan layer.
+"""fps-cap: live fps cap and overlay control for games running through the framepace Vulkan layer.
 
 Usage:
-  fps-cap up|down [n]            raise or lower the cap by n (default 1); switches to manual
-  fps-cap set <fps>              set the cap; switches to manual
-  fps-cap off                    no cap from framepace (overlay only); switches to manual
-  fps-cap adaptive [on|off|toggle]
-  fps-cap overlay [on|off|toggle]
-  fps-cap status
-  fps-cap daemon                 adaptive controller (normally run by the framepace.service user unit)
+  fps-cap [--game KEY] up|down [n]     raise or lower the cap by n (default 1); manual mode
+  fps-cap [--game KEY] set <fps>       set the cap; manual mode
+  fps-cap [--game KEY] off             no cap from framepace (overlay only)
+  fps-cap [--game KEY] adaptive [on|off|toggle]
+  fps-cap [--game KEY] overlay [on|off|toggle]
+  fps-cap [--game KEY] status          the target game
+  fps-cap list                         running games and saved per-game settings
+  fps-cap daemon                       adaptive controller (normally run by framepace.service)
   fps-cap --help
 
-The framepace layer reads the cap from ~/.local/state/framepace/state on every frame and writes
-each frame's timing back into it, so changing the cap is a single write; the next frame uses it.
+Every game process that runs with the framepace layer active has a live state file,
+~/.local/state/framepace/run/<pid>.state, holding its cap, mode flags, overlay flag and per-frame
+timing. The cap is a single write to that file; the next frame uses it. Each game is identified
+by a key (steam-<appid>, or the executable name) and its settings are saved in
+~/.config/framepace/games/<key>.conf, which the layer reads when the game starts:
+  mode = adaptive|manual|off     cap = N (manual cap)     overlay = on|off     last_adaptive = N
+fps-cap is the only writer of those files. up/down/set/off/adaptive/overlay update the game's live
+state and its saved settings; the daemon saves last_adaptive (at most every 15 s, on pause and when
+the game exits).
 
-Adaptive mode follows whichever process is writing frames to that file. The layer reports, per
-frame, how long it took from release to finished rendering (CPU and GPU together). The cap follows
-the slow tail of those times, so it sits where nearly every frame fits: the 99th percentile of the
-last 30 s and the 95th of the last 2 s (whichever needs the lower cap), plus a 5% margin. Busy
-scenes such as crowds show up as a heavier tail and lower the cap at once; it rises by 1 every
-half second once the target has stayed above it for 5 s. Single frames over 100 ms (loading) are
-left out of the tail. As a backup, more than 5% modestly late frames in a second drops the cap to
-just under what the game achieved. The daemon pauses when no new frame arrived for 1 s, the writer
-is gone, or (Hyprland only, optional) the active window is not fullscreen; a frame gap over 250 ms
-(alt-tab, loading) is a break and restarts the measurement window.
+Target game for commands and the daemon, unless --game is given: with Hyprland, the fullscreen
+active window's game; otherwise the game that presented most recently. With --game KEY for a game
+that is not running, only its saved settings change.
+
+Adaptive mode follows the target game. The layer reports, per frame, how long it took from
+release to finished rendering (CPU and GPU together). The cap follows the slow tail of those
+times, so it sits where nearly every frame fits: the 99th percentile of the last 30 s and the 95th
+of the last 2 s (whichever needs the lower cap), plus a 5% margin. Busy scenes such as crowds show
+up as a heavier tail and lower the cap at once; it rises by 1 every half second once the target has
+stayed above it for 5 s. Single frames over 100 ms (loading) are left out of the tail. As a backup,
+more than 5% modestly late frames in a second drops the cap to just under what the game achieved.
+The daemon pauses when no new frame arrived for 1 s or (Hyprland only, optional) the active window
+is not fullscreen; a frame gap over 250 ms (alt-tab, loading) is a break and restarts the
+measurement window. Other running games keep their caps. Dead run files are removed.
 
 Configuration: ~/.config/framepace/config, "key = value" lines:
   MIN_CAP = 50      lowest cap adaptive/manual will set; put it just above your monitor's VRR floor
   MAX_CAP = 0       highest cap; 0 = auto: refresh - refresh^2/3600 (144 Hz -> 138), refresh taken
                     from the fastest connected output (hyprctl, wlr-randr, xrandr; else 138)
   MARGIN = 1.05     cap = 1000 / (tail work time * MARGIN)
+  DEFAULT_MODE = adaptive     for games without saved settings: adaptive, manual or off
+  DEFAULT_OVERLAY = on        for games without saved settings
   PAUSE_WHEN_NOT_FULLSCREEN = yes   Hyprland only: pause adapting while the active window is not
                     fullscreen (ignored when hyprctl or its environment is not available)
 """
+import glob
 import json
 import mmap
 import os
@@ -43,23 +58,29 @@ import subprocess
 import sys
 import time
 
-STATE = os.path.expanduser("~/.local/state/framepace/state")
+STATE_DIR = os.path.expanduser("~/.local/state/framepace")
+RUN_DIR = os.path.join(STATE_DIR, "run")
+OLD_STATE = os.path.join(STATE_DIR, "state")        # layout v1, replaced by per-process run files
+GAMES_DIR = os.path.expanduser("~/.config/framepace/games")
 LOG = os.path.expanduser("~/.cache/framepace/fps-cap.log")
 CONFIG = os.path.expanduser("~/.config/framepace/config")
 PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "fps-cap.pid")
 
-# state file layout v1, see README.md
-MAGIC, VERSION, RING = 0x43415046, 1, 256
-HEADER = struct.Struct("<IIiIQII")      # magic, version, cap, flags, seq, head, pid
+# run file layout v2, see README.md
+MAGIC, VERSION, RING = 0x43415046, 2, 256
+HEADER = struct.Struct("<IIiIQIIQ64s")  # magic, version, cap, flags, seq, head, pid, last_present_ns, game
 FRAME = struct.Struct("<QII")           # present_ns, frame_ns, work_ns
 OFF_CAP, OFF_FLAGS = 8, 12
 SIZE = HEADER.size + RING * FRAME.size
 OVERLAY, ADAPTIVE, MANUAL = 1, 2, 4
+KEY_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,62}$")
 
 # configurable (see the config file)
 MIN_CAP = 50                    # just above the VRR floor (frames collide right at it)
 MAX_CAP = 0                     # 0 = auto from the monitor refresh
 MARGIN = 1.05                   # cap = 1000 / (tail work * MARGIN)
+DEFAULT_MODE = "adaptive"
+DEFAULT_OVERLAY = True
 PAUSE_WHEN_NOT_FULLSCREEN = True
 FALLBACK_MAX = 138              # when the refresh rate cannot be detected (144 Hz)
 
@@ -73,12 +94,13 @@ HITCH = 1.6                     # backup rule: present intervals between deadlin
 DROP_AT = 0.05                  # ... and more than this fraction of them in the last second drops the cap
 STALL_S = 1.0                   # no new frames for this long: the game is not running/visible, pause
 BREAK_MS = 250                  # a frame gap this long (alt-tab, loading) is a break: restart the windows
+PERSIST_S = 15.0                # save last_adaptive at most this often while running
 
 
 # --- configuration ----------------------------------------------------------------------------
 
 def load_config():
-    global MIN_CAP, MAX_CAP, MARGIN, PAUSE_WHEN_NOT_FULLSCREEN
+    global MIN_CAP, MAX_CAP, MARGIN, PAUSE_WHEN_NOT_FULLSCREEN, DEFAULT_MODE, DEFAULT_OVERLAY
     try:
         lines = open(CONFIG).read().splitlines()
     except OSError:
@@ -102,6 +124,12 @@ def load_config():
                     raise ValueError("must be > 0")
             elif key == "PAUSE_WHEN_NOT_FULLSCREEN":
                 PAUSE_WHEN_NOT_FULLSCREEN = val.lower() in ("1", "yes", "true", "on")
+            elif key == "DEFAULT_MODE":
+                if val.lower() not in ("adaptive", "manual", "off"):
+                    raise ValueError("expected adaptive, manual or off")
+                DEFAULT_MODE = val.lower()
+            elif key == "DEFAULT_OVERLAY":
+                DEFAULT_OVERLAY = val.lower() in ("1", "yes", "true", "on")
             else:
                 raise ValueError("unknown key")
         except ValueError as e:
@@ -154,57 +182,256 @@ def max_cap():
     return max(_max_cache[1], MIN_CAP)
 
 
-# --- state file -----------------------------------------------------------------------------
+def clamp_cap(cap):
+    return max(MIN_CAP, min(max_cap(), cap))
 
-class State:
-    def __init__(self):
-        os.makedirs(os.path.dirname(STATE), exist_ok=True)
-        fd = os.open(STATE, os.O_RDWR | os.O_CREAT, 0o644)
+
+# --- saved per-game settings ------------------------------------------------------------------
+
+def valid_key(key):
+    return bool(KEY_RE.match(key)) and not key.startswith(".")
+
+
+def conf_path(key):
+    return os.path.join(GAMES_DIR, key + ".conf")
+
+
+def read_conf(key):
+    """saved settings of a game as {key: value}; missing or unreadable file = {}"""
+    out = {}
+    try:
+        for line in open(conf_path(key)).read().splitlines():
+            line = line.split("#", 1)[0].strip()
+            k, sep, v = (p.strip() for p in line.partition("="))
+            if sep and k:
+                out[k.lower()] = v
+    except OSError:
+        pass
+    return out
+
+
+def write_conf(key, updates):
+    """set keys in a game's .conf, keeping its other lines (atomic replace)"""
+    path = conf_path(key)
+    try:
+        lines = open(path).read().splitlines()
+    except OSError:
+        lines = []
+    pending = dict(updates)
+    for i, line in enumerate(lines):
+        k = line.split("#", 1)[0].partition("=")[0].strip().lower()
+        if k in pending:
+            lines[i] = f"{k} = {pending.pop(k)}"
+    lines += [f"{k} = {v}" for k, v in pending.items()]
+    os.makedirs(GAMES_DIR, exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, path)
+
+
+def saved_keys():
+    return sorted(os.path.basename(p)[:-5] for p in glob.glob(os.path.join(GAMES_DIR, "*.conf")))
+
+
+def effective_settings(key):
+    """saved settings over the DEFAULT_* values: (mode, manual cap, overlay, last_adaptive)"""
+    c = read_conf(key)
+    mode = c.get("mode", DEFAULT_MODE).lower()
+    overlay = c.get("overlay", "on" if DEFAULT_OVERLAY else "off").lower() in ("1", "yes", "true", "on")
+    try:
+        cap = int(c.get("cap", 0))
+    except ValueError:
+        cap = 0
+    try:
+        last = int(c.get("last_adaptive", 0))
+    except ValueError:
+        last = 0
+    return mode if mode in ("adaptive", "manual", "off") else "adaptive", cap, overlay, last
+
+
+# --- live state (run files) -------------------------------------------------------------------
+
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class Run:
+    """one game process's run file"""
+
+    def __init__(self, path):
+        self.path = path
+        fd = os.open(path, os.O_RDWR)
         try:
             if os.fstat(fd).st_size < SIZE:
-                os.ftruncate(fd, SIZE)
+                raise ValueError("short run file")
             self.m = mmap.mmap(fd, SIZE)
         finally:
             os.close(fd)
-        magic, version, *_ = HEADER.unpack_from(self.m, 0)
+        magic, version = struct.unpack_from("<II", self.m, 0)
         if (magic, version) != (MAGIC, VERSION):
-            HEADER.pack_into(self.m, 0, MAGIC, VERSION, max_cap(), OVERLAY | ADAPTIVE, 0, 0, 0)
+            self.m.close()
+            raise ValueError("not a v2 run file")
 
     def header(self):
-        _, _, cap, flags, seq, head, pid = HEADER.unpack_from(self.m, 0)
-        return cap, flags, seq, head, pid
+        _, _, cap, flags, seq, head, pid, last_ns, game = HEADER.unpack_from(self.m, 0)
+        return cap, flags, seq, head, pid, last_ns, game
 
     @property
     def cap(self):
         return self.header()[0]
 
-    def set_cap(self, cap):
-        cap = max(MIN_CAP, min(max_cap(), cap))
-        struct.pack_into("<i", self.m, OFF_CAP, cap)
-        return cap
-
     @property
     def flags(self):
         return self.header()[1]
 
+    @property
+    def seq(self):
+        return self.header()[2]
+
+    @property
+    def pid(self):
+        return self.header()[4]
+
+    @property
+    def last_ns(self):
+        return self.header()[5]
+
+    @property
+    def key(self):
+        return self.header()[6].split(b"\0")[0].decode("ascii", "replace")
+
+    def set_cap(self, cap):
+        cap = clamp_cap(cap)
+        struct.pack_into("<i", self.m, OFF_CAP, cap)
+        return cap
+
+    def set_raw_cap(self, cap):
+        struct.pack_into("<i", self.m, OFF_CAP, cap)
+
     def set_flags(self, on=0, off=0):
         struct.pack_into("<I", self.m, OFF_FLAGS, (self.flags | on) & ~off)
 
+    def set_mode(self, adaptive):
+        self.set_flags(on=ADAPTIVE if adaptive else MANUAL, off=MANUAL if adaptive else ADAPTIVE)
+
     def frames_since(self, seq_seen):
         """frames presented since seq_seen as (present_ns, frame_ns, work_ns), the current seq and writer pid"""
-        _, _, seq, head, pid = self.header()
+        _, _, seq, head, pid, _, _ = self.header()
         n = max(min(seq - seq_seen, RING), 0) if seq_seen else 0
         frames = [FRAME.unpack_from(self.m, HEADER.size + ((head - i) % RING) * FRAME.size)
                   for i in range(n - 1, -1, -1)]
         return frames, seq, pid
 
+    def recent_fps(self):
+        """mean fps over the last ~0.5 s of frames, None when idle"""
+        cap, flags, seq, head, pid, last_ns, game = self.header()
+        if not seq or time.monotonic_ns() - last_ns > 2e9:
+            return None
+        vals = []
+        for i in range(min(seq, RING)):
+            ns = FRAME.unpack_from(self.m, HEADER.size + ((head - i) % RING) * FRAME.size)[1]
+            if ns:
+                vals.append(ns)
+                if sum(vals) >= 5e8:
+                    break
+        return 1e9 * len(vals) / sum(vals) if vals else None
 
-def mode(st):
-    return "adaptive" if st.flags & ADAPTIVE else "manual"
+    def mode(self):
+        cap, flags = self.header()[:2]
+        if flags & ADAPTIVE:
+            return "adaptive"
+        return "off" if cap == 0 else "manual"
 
 
-def set_mode(st, adaptive):
-    st.set_flags(on=ADAPTIVE if adaptive else MANUAL, off=MANUAL if adaptive else ADAPTIVE)
+def scan_runs(cache):
+    """live runs, newest file state; run files of dead pids are removed"""
+    live = {}
+    for path in glob.glob(os.path.join(RUN_DIR, "*.state")):
+        run = cache.get(path)
+        if run is None:
+            try:
+                run = Run(path)
+            except (OSError, ValueError):
+                continue
+        pid = run.pid
+        if not pid_alive(pid):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            run.m.close()
+            cache.pop(path, None)
+            continue
+        cache[path] = run
+        live[path] = run
+    for path in [p for p in cache if p not in live]:
+        cache.pop(path).m.close()
+    return list(live.values())
+
+
+def migrate():
+    """the single v1 state file is gone; remove it"""
+    try:
+        os.unlink(OLD_STATE)
+    except OSError:
+        pass
+
+
+# --- target selection --------------------------------------------------------------------------
+
+def hypr_active():
+    """the active window as a dict, or None without Hyprland"""
+    if not (shutil.which("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")):
+        return None
+    try:
+        w = json.loads(_run(["hyprctl", "activewindow", "-j"], timeout=2) or "{}")
+    except ValueError:
+        return None
+    return w if isinstance(w, dict) else None
+
+
+def is_descendant(pid, ancestor):
+    for _ in range(12):
+        if pid == ancestor:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rpartition(")")[2].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def pick_by_window(runs, window):
+    """the game of the fullscreen active window (Hyprland), if it has a run file"""
+    if window and window.get("fullscreen") and window.get("pid"):
+        for r in runs:
+            if is_descendant(r.pid, window["pid"]):
+                return r
+    return None
+
+
+def pick_target(runs, window=None):
+    """the fullscreen active window's game (Hyprland), else the most recent presenter"""
+    if not runs:
+        return None
+    return pick_by_window(runs, window) or max(runs, key=lambda r: r.last_ns)
+
+
+def not_fullscreen(window):
+    """Optional Hyprland nicety: True when the active window is known not to be fullscreen."""
+    return bool(PAUSE_WHEN_NOT_FULLSCREEN and window is not None and not window.get("fullscreen"))
 
 
 def log(text):
@@ -224,30 +451,16 @@ def notify(text):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def pid_alive(pid):
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def not_fullscreen():
-    """Optional Hyprland nicety: True when the active window is known not to be fullscreen."""
-    if not (PAUSE_WHEN_NOT_FULLSCREEN and shutil.which("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")):
-        return False
-    try:
-        w = json.loads(_run(["hyprctl", "activewindow", "-j"], timeout=2) or "{}")
-    except ValueError:
-        return False
-    return not w.get("fullscreen")
-
-
 # --- adaptive controller --------------------------------------------------------------------
+
+def persist_adaptive(run_key, cap, persisted):
+    if cap > 0 and persisted.get(run_key) != cap:
+        try:
+            write_conf(run_key, {"last_adaptive": cap})
+            persisted[run_key] = cap
+        except OSError as e:
+            log(f"cannot save settings for {run_key}: {e}")
+
 
 def daemon():
     try:
@@ -261,49 +474,74 @@ def daemon():
         pass
     with open(PIDFILE, "w") as f:
         f.write(str(os.getpid()))
+    migrate()
 
-    st = State()
     log(f"daemon started: min cap {MIN_CAP}, max cap {max_cap()}, margin {MARGIN}")
-    seq, frames, followed, paused = 0, [], None, "no game yet"
+    cache, known, persisted = {}, {}, {}     # known: run path -> (key, cap, adaptive) of live runs
+    st, seq, frames, paused = None, 0, [], "no game yet"
     changed_ns, above_since = 0, None
-    last_frame_s, fs_checked, fs_block = time.monotonic(), 0.0, False
+    last_frame_s, last_persist = time.monotonic(), 0.0
+    window, window_s = None, 0.0
     while True:
         time.sleep(TICK)
         now_s = time.monotonic()
+        runs = scan_runs(cache)
+
+        # games that exited: save where adaptive mode had settled
+        for path in [p for p in known if p not in cache]:
+            key, cap, adaptive = known.pop(path)
+            if adaptive:
+                persist_adaptive(key, cap, persisted)
+        for r in runs:
+            known[r.path] = (r.key, r.cap, bool(r.flags & ADAPTIVE))
+
+        if now_s - window_s > 1.0:
+            window, window_s = hypr_active(), now_s
+        tgt = pick_target(runs, window)
+        if (st is not None and tgt is not None and tgt.path != st.path and st.path in cache
+                and not pick_by_window(runs, window) and time.monotonic_ns() - st.last_ns < STALL_S * 1e9):
+            tgt = st        # two games presenting at once: stay with the current one until it stalls
+        if tgt is None:
+            if st is not None:
+                log("no game running")
+            st, frames, above_since, paused = None, [], None, "no game running"
+            continue
+        if st is None or tgt.path != st.path:        # another game: start measuring afresh
+            if st is not None and st.path in cache and st.flags & ADAPTIVE:
+                persist_adaptive(st.key, st.cap, persisted)
+            st, seq, frames, above_since, changed_ns = tgt, 0, [], None, 0
+            last_frame_s, last_persist = now_s, now_s
+            log(f"following {st.key} (pid {st.pid}), cap {st.cap}")
+
         prev_seq = seq
         new, seq, pid = st.frames_since(seq)
         if seq != prev_seq:
             last_frame_s = now_s
-        if pid != followed or seq < prev_seq:       # a different game (or a fresh state file)
+        if seq < prev_seq:                           # restarted under the same path
             frames, above_since, changed_ns = [], None, 0
-            if pid != followed:
-                if pid:
-                    log(f"following pid {pid}, cap {st.cap}")
-            followed, new = pid, []
-            last_frame_s = now_s
 
         why = None
         if not st.flags & ADAPTIVE:
             why = "manual mode"
-        elif not pid_alive(pid):
-            why = f"pid {pid} is gone" if pid else "no game has presented yet"
         elif now_s - last_frame_s > STALL_S:
             why = "no new frames"
-        else:
-            if now_s - fs_checked > 1.0:
-                fs_checked, fs_block = now_s, not_fullscreen()
-            if fs_block:
-                why = "active window is not fullscreen"
+        elif not_fullscreen(window):
+            why = "active window is not fullscreen"
         if why:
             frames, above_since = [], None
             if why != paused and why != "manual mode":
                 log(f"paused: {why}")
+                if st.flags & ADAPTIVE:
+                    persist_adaptive(st.key, st.cap, persisted)
             paused = why
             continue
         if paused:
             if paused != "manual mode":
-                log(f"resumed, pid {pid}, cap {st.cap}")
+                log(f"resumed {st.key}, cap {st.cap}")
             paused = None
+        if now_s - last_persist >= PERSIST_S:
+            persist_adaptive(st.key, st.cap, persisted)
+            last_persist = now_s
 
         now_ns = time.monotonic_ns()  # CLOCK_MONOTONIC, the layer's clock for present_ns
         for f in new:
@@ -353,40 +591,138 @@ def daemon():
 
 # --- commands -------------------------------------------------------------------------------
 
+def resolve(game, cache):
+    """(key, run or None) the command applies to; exits when there is no game"""
+    runs = scan_runs(cache)
+    if game:
+        if not valid_key(game):
+            sys.exit(f"fps-cap: invalid game key {game!r}")
+        mine = [r for r in runs if r.key == game]
+        return game, (max(mine, key=lambda r: r.last_ns) if mine else None)
+    run = pick_target(runs, hypr_active())
+    if run is None:
+        sys.exit("fps-cap: no game is running with framepace (use --game KEY to change saved settings)")
+    return run.key, run
+
+
+def cmd_cap(key, run, cap, manual_off=False):
+    """manual cap (or off) for a game: live state and saved settings"""
+    if manual_off:
+        if run:
+            run.set_mode(adaptive=False)
+            run.set_raw_cap(0)
+        write_conf(key, {"mode": "off"})
+        return 0
+    cap = clamp_cap(cap)
+    if run:
+        run.set_mode(adaptive=False)
+        run.set_cap(cap)
+    write_conf(key, {"mode": "manual", "cap": cap})
+    return cap
+
+
+def current_cap(key, run):
+    if run and run.cap:
+        return run.cap
+    mode, cap, _, last = effective_settings(key)
+    return cap or last or max_cap()      # from "off", start at the ceiling
+
+
+def describe(key, run):
+    mode, cap, overlay, last = effective_settings(key)
+    if run:
+        cap_now = run.cap
+        flags = run.flags
+        return (f"{key}: {run.mode()}, cap {cap_now if cap_now else 'off'}, overlay {'on' if flags & OVERLAY else 'off'}, "
+                f"frames {run.seq} (pid {run.pid}, running), limits {MIN_CAP}-{max_cap()}")
+    cap_txt = f", cap {cap}" if mode == "manual" and cap else ""
+    last_txt = f", last adaptive {last}" if last else ""
+    return f"{key}: not running; saved: {mode}{cap_txt}, overlay {'on' if overlay else 'off'}{last_txt}"
+
+
+def cmd_list(cache):
+    runs = sorted(scan_runs(cache), key=lambda r: r.key)
+    target = pick_target(runs, hypr_active())
+    print("running:" if runs else "no game running")
+    for r in runs:
+        fps = r.recent_fps()
+        fps_txt = f"{fps:.1f} fps" if fps else "idle"
+        cap = r.cap
+        print(f"  {'*' if r is target else ' '} {r.key:<24} pid {r.pid:<8} {r.mode():<8} "
+              f"cap {cap if cap else 'off':<4} overlay {'on' if r.flags & OVERLAY else 'off':<3} {fps_txt}")
+    running = {r.key for r in runs}
+    rest = [k for k in saved_keys() if k not in running]
+    if rest:
+        print("saved:")
+        for k in rest:
+            mode, cap, overlay, last = effective_settings(k)
+            extra = (f" cap {cap}" if mode == "manual" and cap else "") + (f" last_adaptive {last}" if last else "")
+            print(f"    {k:<24} {mode}{extra} overlay {'on' if overlay else 'off'}")
+    print(f"limits {MIN_CAP}-{max_cap()}  (* = target of commands and the daemon)")
+
+
 def main(argv):
-    cmd = argv[1] if len(argv) > 1 else "status"
-    if cmd in ("-h", "--help", "help"):
+    args = argv[1:]
+    if any(a in ("-h", "--help", "help") for a in args):
         print(__doc__)
         return 0
+    game = None
+    if "--game" in args:
+        i = args.index("--game")
+        if i + 1 >= len(args):
+            print(__doc__, file=sys.stderr)
+            return 2
+        game = args[i + 1]
+        del args[i:i + 2]
+    cmd = args[0] if args else "status"
     load_config()
-    st = State()
+    migrate()
+    cache = {}
     try:
-        if cmd in ("up", "down"):
-            n = int(argv[2]) if len(argv) > 2 else 1
-            set_mode(st, adaptive=False)
-            st.set_cap((st.cap or max_cap()) + (n if cmd == "up" else -n))  # from "off", start at the ceiling
-        elif cmd == "set":
-            set_mode(st, adaptive=False)
-            st.set_cap(int(argv[2]))
-        elif cmd == "off":
-            set_mode(st, adaptive=False)
-            struct.pack_into("<i", st.m, OFF_CAP, 0)  # 0 = unlimited in the layer
-        elif cmd in ("adaptive", "overlay"):
-            want = argv[2] if len(argv) > 2 else "toggle"
-            bit = ADAPTIVE if cmd == "adaptive" else OVERLAY
-            on = {"on": True, "off": False}.get(want, not st.flags & bit)
-            if cmd == "adaptive":
-                set_mode(st, adaptive=on)
-                notify(f"FPS cap: {'adaptive' if on else 'manual'} ({st.cap})")
-            else:
-                st.set_flags(on=OVERLAY if on else 0, off=0 if on else OVERLAY)
-        elif cmd == "daemon":
+        if cmd == "daemon":
             daemon()
+        elif cmd == "list":
+            cmd_list(cache)
         elif cmd == "status":
-            cap, flags, seq, head, pid = st.header()
-            print(f"{mode(st)}, cap {cap if cap else 'off'}, overlay {'on' if flags & OVERLAY else 'off'}, "
-                  f"frames {seq} (pid {pid}, {'running' if pid_alive(pid) else 'not running'}), "
-                  f"limits {MIN_CAP}-{max_cap()}")
+            runs = scan_runs(cache)
+            if game or runs:
+                key, run = resolve(game, cache)
+                print(describe(key, run))
+            else:
+                print(f"no game running, limits {MIN_CAP}-{max_cap()}")
+        elif cmd in ("up", "down", "set", "off", "adaptive", "overlay"):
+            key, run = resolve(game, cache)
+            if cmd in ("up", "down"):
+                n = int(args[1]) if len(args) > 1 else 1
+                cmd_cap(key, run, current_cap(key, run) + (n if cmd == "up" else -n))
+            elif cmd == "set":
+                cmd_cap(key, run, int(args[1]))
+            elif cmd == "off":
+                cmd_cap(key, run, 0, manual_off=True)
+            else:
+                want = args[1] if len(args) > 1 else "toggle"
+                if want not in ("on", "off", "toggle"):
+                    raise ValueError(want)
+                mode, cap, overlay, last = effective_settings(key)
+                if cmd == "adaptive":
+                    now_on = bool(run.flags & ADAPTIVE) if run else mode == "adaptive"
+                    on = {"on": True, "off": False}.get(want, not now_on)
+                    if run:
+                        run.set_mode(adaptive=on)
+                    if on:
+                        write_conf(key, {"mode": "adaptive"})
+                    else:
+                        keep = run.cap if run and run.cap else cap
+                        write_conf(key, {"mode": "manual" if keep else "off"})
+                        if keep:
+                            write_conf(key, {"cap": keep})
+                    notify(f"FPS cap {key}: {'adaptive' if on else 'manual'} ({run.cap if run else 'saved'})")
+                else:
+                    now_on = bool(run.flags & OVERLAY) if run else overlay
+                    on = {"on": True, "off": False}.get(want, not now_on)
+                    if run:
+                        run.set_flags(on=OVERLAY if on else 0, off=0 if on else OVERLAY)
+                    write_conf(key, {"overlay": "on" if on else "off"})
         else:
             print(__doc__, file=sys.stderr)
             return 2
