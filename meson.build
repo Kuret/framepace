@@ -17,6 +17,7 @@ endif
 
 layer_sources = files(
   'src/layer.c',
+  'src/state.c',
   'src/util.c',
 )
 

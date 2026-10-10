@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "dispatch.h"
+#include "state.h"
 #include "util.h"
 
 /* ---- instance / device registries (dispatch key -> object) -------------- */
@@ -148,6 +149,7 @@ fp_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
     g_instances = inst;
     pthread_mutex_unlock(&g_reg_lock);
 
+    fp_state_open();
     fp_log("layer loaded (instance %p)", (void *)*pInstance);
     return VK_SUCCESS;
 }
