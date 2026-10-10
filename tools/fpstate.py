@@ -97,7 +97,8 @@ def entries(m, n):
 
 def cmd_get(m):
     magic, version, cap, flags, seq, head, pid, last_ns, game = HDR.unpack_from(m, 0)
-    print(f"game={game.split(b'\0')[0].decode()} version={version} cap={cap} flags={flags:#x} "
+    name = game.split(b"\0")[0].decode()
+    print(f"game={name} version={version} cap={cap} flags={flags:#x} "
           f"(overlay={bool(flags & F_OVERLAY)} adaptive={bool(flags & F_ADAPTIVE)} "
           f"manual={bool(flags & F_MANUAL)}) seq={seq} head={head} pid={pid} last_present_ns={last_ns}")
 
