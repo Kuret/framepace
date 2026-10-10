@@ -198,6 +198,16 @@ install_tool() {
 
 write_env() {
     step "Session environment"
+    # Respect a FRAMEPACE=1 the user already set in another environment.d file (e.g. a
+    # system-wide one), instead of adding a second copy of it.
+    for f in /etc/environment.d/*.conf /usr/lib/environment.d/*.conf "$CONFIG_HOME"/environment.d/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$CONFIG_HOME/environment.d/90-framepace.conf" ] && continue
+        if grep -q '^[[:space:]]*FRAMEPACE=1[[:space:]]*$' "$f"; then
+            say "FRAMEPACE=1 is already set in $f; not writing $CONFIG_HOME/environment.d/90-framepace.conf"
+            return
+        fi
+    done
     write_file "$CONFIG_HOME/environment.d/90-framepace.conf" <<'EOT'
 # Loads the framepace Vulkan layer into every Vulkan app; it only activates in games
 # (Steam/Proton/Wine/Lutris/umu environments, or FRAMEPACE_FORCE=1). See the framepace README.
