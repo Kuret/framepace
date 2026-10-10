@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""fps-cap: live fps cap for games running through the framepace Vulkan layer.
+
+Usage:
+  fps-cap up|down [n]            raise or lower the cap by n (default 1); switches to manual
+  fps-cap set <fps>              set the cap; switches to manual
+  fps-cap off                    no cap from framepace (overlay only); switches to manual
+  fps-cap adaptive [on|off|toggle]
+  fps-cap overlay [on|off|toggle]
+  fps-cap status
+  fps-cap daemon                 adaptive controller (normally run by the framepace.service user unit)
+  fps-cap --help
+
+The framepace layer reads the cap from ~/.local/state/framepace/state on every frame and writes
+each frame's timing back into it, so changing the cap is a single write; the next frame uses it.
+
+Adaptive mode follows whichever process is writing frames to that file. The layer reports, per
+frame, how long it took from release to finished rendering (CPU and GPU together). The cap follows
+the slow tail of those times, so it sits where nearly every frame fits: the 99th percentile of the
+last 30 s and the 95th of the last 2 s (whichever needs the lower cap), plus a 5% margin. Busy
+scenes such as crowds show up as a heavier tail and lower the cap at once; it rises by 1 every
+half second once the target has stayed above it for 5 s. Single frames over 100 ms (loading) are
+left out of the tail. As a backup, more than 5% modestly late frames in a second drops the cap to
+just under what the game achieved. The daemon pauses when no new frame arrived for 1 s, the writer
+is gone, or (Hyprland only, optional) the active window is not fullscreen; a frame gap over 250 ms
+(alt-tab, loading) is a break and restarts the measurement window.
+
+Configuration: ~/.config/framepace/config, "key = value" lines:
+  MIN_CAP = 50      lowest cap adaptive/manual will set; put it just above your monitor's VRR floor
+  MAX_CAP = 0       highest cap; 0 = auto: refresh - refresh^2/3600 (144 Hz -> 138), refresh taken
+                    from the fastest connected output (hyprctl, wlr-randr, xrandr; else 138)
+  MARGIN = 1.05     cap = 1000 / (tail work time * MARGIN)
+  PAUSE_WHEN_NOT_FULLSCREEN = yes   Hyprland only: pause adapting while the active window is not
+                    fullscreen (ignored when hyprctl or its environment is not available)
+"""
+import json
+import mmap
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+STATE = os.path.expanduser("~/.local/state/framepace/state")
+LOG = os.path.expanduser("~/.cache/framepace/fps-cap.log")
+CONFIG = os.path.expanduser("~/.config/framepace/config")
+PIDFILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "fps-cap.pid")
+
+# state file layout v1, see README.md
+MAGIC, VERSION, RING = 0x43415046, 1, 256
+HEADER = struct.Struct("<IIiIQII")      # magic, version, cap, flags, seq, head, pid
+FRAME = struct.Struct("<QII")           # present_ns, frame_ns, work_ns
+OFF_CAP, OFF_FLAGS = 8, 12
+SIZE = HEADER.size + RING * FRAME.size
+OVERLAY, ADAPTIVE, MANUAL = 1, 2, 4
+
+# configurable (see the config file)
+MIN_CAP = 50                    # just above the VRR floor (frames collide right at it)
+MAX_CAP = 0                     # 0 = auto from the monitor refresh
+MARGIN = 1.05                   # cap = 1000 / (tail work * MARGIN)
+PAUSE_WHEN_NOT_FULLSCREEN = True
+FALLBACK_MAX = 138              # when the refresh rate cannot be detected (144 Hz)
+
+TICK = 0.25                     # seconds between decisions
+TAIL_LONG, TAIL_LONG_Q = 30.0, 0.99   # window (s) and percentile of frame work the cap must fit; crowds burst every ~20-30 s
+TAIL_SHORT, TAIL_SHORT_Q = 2.0, 0.95  # a short window, so walking into a crowd lowers the cap within ~1-2 s
+LOADING_MS = 100                # frames slower than this are loading hitches, not the scene's load
+RISE_HOLD, RISE_STEP = 5.0, 0.5 # target must stay above the cap this long; then +1 per RISE_STEP s
+LATE_FACTOR, LATE_SLACK_MS = 1.10, 1.0
+HITCH = 1.6                     # backup rule: present intervals between deadline and HITCH intervals are late
+DROP_AT = 0.05                  # ... and more than this fraction of them in the last second drops the cap
+STALL_S = 1.0                   # no new frames for this long: the game is not running/visible, pause
+BREAK_MS = 250                  # a frame gap this long (alt-tab, loading) is a break: restart the windows
+
+
+# --- configuration ----------------------------------------------------------------------------
+
+def load_config():
+    global MIN_CAP, MAX_CAP, MARGIN, PAUSE_WHEN_NOT_FULLSCREEN
+    try:
+        lines = open(CONFIG).read().splitlines()
+    except OSError:
+        return
+    for n, line in enumerate(lines, 1):
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, sep, val = (p.strip() for p in line.partition("="))
+        try:
+            if not sep:
+                raise ValueError("expected key = value")
+            key = key.upper()
+            if key == "MIN_CAP":
+                MIN_CAP = max(1, int(val))
+            elif key == "MAX_CAP":
+                MAX_CAP = max(0, int(val))
+            elif key == "MARGIN":
+                MARGIN = float(val)
+                if MARGIN <= 0:
+                    raise ValueError("must be > 0")
+            elif key == "PAUSE_WHEN_NOT_FULLSCREEN":
+                PAUSE_WHEN_NOT_FULLSCREEN = val.lower() in ("1", "yes", "true", "on")
+            else:
+                raise ValueError("unknown key")
+        except ValueError as e:
+            print(f"fps-cap: {CONFIG}:{n}: {e}: {line!r}", file=sys.stderr)
+
+
+def _run(cmd, timeout=3):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def detect_refresh():
+    """highest refresh rate (Hz) among connected outputs, or None"""
+    rates = []
+    if shutil.which("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        try:
+            rates = [float(m["refreshRate"]) for m in json.loads(_run(["hyprctl", "monitors", "-j"]) or "[]")
+                     if not m.get("disabled")]
+        except (ValueError, KeyError, TypeError):
+            rates = []
+    if not rates and shutil.which("wlr-randr"):
+        out = _run(["wlr-randr", "--json"])
+        try:
+            for o in json.loads(out or "[]"):
+                if o.get("enabled", True):
+                    rates += [float(m["refresh"]) for m in o.get("modes", []) if m.get("current")]
+        except (ValueError, KeyError, TypeError):
+            rates = []
+        if not rates:
+            rates = [float(r) for r in re.findall(r"([\d.]+) Hz[^\n]*current", _run(["wlr-randr"]))]
+    if not rates and shutil.which("xrandr"):
+        rates = [float(r) for r in re.findall(r"(\d+(?:\.\d+)?)\*", _run(["xrandr"]))]
+    rates = [r for r in rates if r > 0]
+    return max(rates) if rates else None
+
+
+_max_cache = (0.0, FALLBACK_MAX)
+
+
+def max_cap():
+    """MAX_CAP from the config, or refresh - refresh^2/3600 (cached 30 s)"""
+    global _max_cache
+    if MAX_CAP > 0:
+        return max(MAX_CAP, MIN_CAP)
+    if time.monotonic() - _max_cache[0] > 30:
+        hz = detect_refresh()
+        _max_cache = (time.monotonic(), int(hz - hz * hz / 3600) if hz else FALLBACK_MAX)
+    return max(_max_cache[1], MIN_CAP)
+
+
+# --- state file -----------------------------------------------------------------------------
+
+class State:
+    def __init__(self):
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        fd = os.open(STATE, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            if os.fstat(fd).st_size < SIZE:
+                os.ftruncate(fd, SIZE)
+            self.m = mmap.mmap(fd, SIZE)
+        finally:
+            os.close(fd)
+        magic, version, *_ = HEADER.unpack_from(self.m, 0)
+        if (magic, version) != (MAGIC, VERSION):
+            HEADER.pack_into(self.m, 0, MAGIC, VERSION, max_cap(), OVERLAY | ADAPTIVE, 0, 0, 0)
+
+    def header(self):
+        _, _, cap, flags, seq, head, pid = HEADER.unpack_from(self.m, 0)
+        return cap, flags, seq, head, pid
+
+    @property
+    def cap(self):
+        return self.header()[0]
+
+    def set_cap(self, cap):
+        cap = max(MIN_CAP, min(max_cap(), cap))
+        struct.pack_into("<i", self.m, OFF_CAP, cap)
+        return cap
+
+    @property
+    def flags(self):
+        return self.header()[1]
+
+    def set_flags(self, on=0, off=0):
+        struct.pack_into("<I", self.m, OFF_FLAGS, (self.flags | on) & ~off)
+
+    def frames_since(self, seq_seen):
+        """frames presented since seq_seen as (present_ns, frame_ns, work_ns), the current seq and writer pid"""
+        _, _, seq, head, pid = self.header()
+        n = max(min(seq - seq_seen, RING), 0) if seq_seen else 0
+        frames = [FRAME.unpack_from(self.m, HEADER.size + ((head - i) % RING) * FRAME.size)
+                  for i in range(n - 1, -1, -1)]
+        return frames, seq, pid
+
+
+def mode(st):
+    return "adaptive" if st.flags & ADAPTIVE else "manual"
+
+
+def set_mode(st, adaptive):
+    st.set_flags(on=ADAPTIVE if adaptive else MANUAL, off=MANUAL if adaptive else ADAPTIVE)
+
+
+def log(text):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + text
+    print(line, flush=True)
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def notify(text):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "fps-cap", "-t", "1500", text],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def not_fullscreen():
+    """Optional Hyprland nicety: True when the active window is known not to be fullscreen."""
+    if not (PAUSE_WHEN_NOT_FULLSCREEN and shutil.which("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")):
+        return False
+    try:
+        w = json.loads(_run(["hyprctl", "activewindow", "-j"], timeout=2) or "{}")
+    except ValueError:
+        return False
+    return not w.get("fullscreen")
+
+
+# --- adaptive controller --------------------------------------------------------------------
+
+def daemon():
+    try:
+        with open(PIDFILE) as f:
+            old = int(f.read())
+        with open(f"/proc/{old}/cmdline", "rb") as f:
+            if b"fps-cap" in f.read() and old != os.getpid():
+                print("fps-cap daemon already running", file=sys.stderr)
+                return
+    except (OSError, ValueError):
+        pass
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    st = State()
+    log(f"daemon started: min cap {MIN_CAP}, max cap {max_cap()}, margin {MARGIN}")
+    seq, frames, followed, paused = 0, [], None, "no game yet"
+    changed_ns, above_since = 0, None
+    last_frame_s, fs_checked, fs_block = time.monotonic(), 0.0, False
+    while True:
+        time.sleep(TICK)
+        now_s = time.monotonic()
+        prev_seq = seq
+        new, seq, pid = st.frames_since(seq)
+        if seq != prev_seq:
+            last_frame_s = now_s
+        if pid != followed or seq < prev_seq:       # a different game (or a fresh state file)
+            frames, above_since, changed_ns = [], None, 0
+            if pid != followed:
+                if pid:
+                    log(f"following pid {pid}, cap {st.cap}")
+            followed, new = pid, []
+            last_frame_s = now_s
+
+        why = None
+        if not st.flags & ADAPTIVE:
+            why = "manual mode"
+        elif not pid_alive(pid):
+            why = f"pid {pid} is gone" if pid else "no game has presented yet"
+        elif now_s - last_frame_s > STALL_S:
+            why = "no new frames"
+        else:
+            if now_s - fs_checked > 1.0:
+                fs_checked, fs_block = now_s, not_fullscreen()
+            if fs_block:
+                why = "active window is not fullscreen"
+        if why:
+            frames, above_since = [], None
+            if why != paused and why != "manual mode":
+                log(f"paused: {why}")
+            paused = why
+            continue
+        if paused:
+            if paused != "manual mode":
+                log(f"resumed, pid {pid}, cap {st.cap}")
+            paused = None
+
+        now_ns = time.monotonic_ns()  # CLOCK_MONOTONIC, the layer's clock for present_ns
+        for f in new:
+            if f[1] > BREAK_MS * 1e6:   # alt-tab, minimised, loading: not part of the scene, start over
+                frames, above_since = [], None
+            else:
+                frames.append(f)
+        frames = [f for f in frames if f[0] > now_ns - TAIL_LONG * 1e9]
+        if len(frames) < 60:
+            continue
+        cap = st.cap
+
+        def tail(seconds, q):
+            work = sorted(f[2] / 1e6 for f in frames if f[0] > now_ns - seconds * 1e9 and f[2] / 1e6 < LOADING_MS)
+            return work[min(len(work) - 1, int(len(work) * q))] if len(work) >= 10 else None
+
+        long_tail, short_tail = tail(TAIL_LONG, TAIL_LONG_Q), tail(TAIL_SHORT, TAIL_SHORT_Q)
+        if long_tail is None:
+            continue
+        worst = max(long_tail, short_tail or 0)
+        target = max(MIN_CAP, min(max_cap(), int(1000 / (worst * MARGIN))))
+
+        # backup: frames actually arriving modestly late under the current cap
+        recent = [f[1] / 1e6 for f in frames if f[0] > max(now_ns - 1e9, changed_ns)]
+        interval = 1000 / cap if cap else 1000 / max_cap()
+        late = sum(interval * LATE_FACTOR + LATE_SLACK_MS < v < interval * HITCH for v in recent) / max(len(recent), 1)
+        if len(recent) >= 20 and late >= DROP_AT and cap > MIN_CAP:
+            achieved = 1000 / (sum(recent) / len(recent))
+            target = min(target, int(achieved * 0.96))
+
+        new_cap, why = None, ""
+        if cap <= 0:        # unlimited: take the target straight away instead of climbing from the floor
+            new_cap, why = st.set_cap(target), "start"
+        elif target < cap:
+            new_cap, why = st.set_cap(target), "tail grew" if late < DROP_AT else f"{late:.0%} late"
+            above_since = None
+        elif target > cap:
+            above_since = above_since or now_ns
+            if (now_ns - above_since) / 1e9 >= RISE_HOLD and (now_ns - changed_ns) / 1e9 >= RISE_STEP:
+                new_cap, why = st.set_cap(cap + 1), "tail short"
+        else:
+            above_since = None
+        if new_cap is not None and new_cap != cap:
+            log(f"{cap} -> {new_cap}: {why}; p99/30s {long_tail:.1f} ms, p95/2s {short_tail or 0:.1f} ms, target {target}")
+            changed_ns = now_ns
+
+
+# --- commands -------------------------------------------------------------------------------
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    load_config()
+    st = State()
+    try:
+        if cmd in ("up", "down"):
+            n = int(argv[2]) if len(argv) > 2 else 1
+            set_mode(st, adaptive=False)
+            st.set_cap((st.cap or max_cap()) + (n if cmd == "up" else -n))  # from "off", start at the ceiling
+        elif cmd == "set":
+            set_mode(st, adaptive=False)
+            st.set_cap(int(argv[2]))
+        elif cmd == "off":
+            set_mode(st, adaptive=False)
+            struct.pack_into("<i", st.m, OFF_CAP, 0)  # 0 = unlimited in the layer
+        elif cmd in ("adaptive", "overlay"):
+            want = argv[2] if len(argv) > 2 else "toggle"
+            bit = ADAPTIVE if cmd == "adaptive" else OVERLAY
+            on = {"on": True, "off": False}.get(want, not st.flags & bit)
+            if cmd == "adaptive":
+                set_mode(st, adaptive=on)
+                notify(f"FPS cap: {'adaptive' if on else 'manual'} ({st.cap})")
+            else:
+                st.set_flags(on=OVERLAY if on else 0, off=0 if on else OVERLAY)
+        elif cmd == "daemon":
+            daemon()
+        elif cmd == "status":
+            cap, flags, seq, head, pid = st.header()
+            print(f"{mode(st)}, cap {cap if cap else 'off'}, overlay {'on' if flags & OVERLAY else 'off'}, "
+                  f"frames {seq} (pid {pid}, {'running' if pid_alive(pid) else 'not running'}), "
+                  f"limits {MIN_CAP}-{max_cap()}")
+        else:
+            print(__doc__, file=sys.stderr)
+            return 2
+    except (IndexError, ValueError):
+        print(__doc__, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except KeyboardInterrupt:
+        sys.exit(130)
