@@ -74,8 +74,11 @@ struct fp_state {
   Readers should load `seq` with acquire semantics (plain loads are fine on x86).
 - `present_ns`: CLOCK_MONOTONIC when the frame was handed down to the driver.
   `frame_ns`: interval since the previous present (0 for the first frame).
-  `work_ns`: previous present returned -> this vkQueuePresentKHR call, i.e.
-  frame time without the limiter's wait.
+  `work_ns`: previous present returned -> frame rendered, i.e. CPU plus GPU
+  time for the frame without the limiter's wait, and the best headroom measure
+  available. When the layer did not wait for the GPU (cap 0, or a present that
+  could not be relayed) it is previous present returned -> this
+  vkQueuePresentKHR call instead.
 - `seq` is not reset when a new process attaches; use `pid` and `present_ns` to
   detect restarts.
 
@@ -90,12 +93,19 @@ struct fp_state {
 
 ## Limiter
 
-In `vkQueuePresentKHR`, after the overlay is submitted and before calling
-down: with `cap > 0` the deadline advances by `1e9/cap` per frame; if the
-frame is more than one interval late the grid resyncs to now. Otherwise it
-`clock_nanosleep`s to `deadline - 300us`, then spins to the deadline. A cap
-change restarts the grid from the last present time, so there is no jump.
-With `cap <= 0` there is no wait.
+The GPU usually finishes a frame some variable time after the app's
+`vkQueuePresentKHR`, so presenting exactly at the deadline makes the frame
+reach the display at deadline + GPU time. To avoid that, with `cap > 0` the
+layer relays the present: it submits an (optionally overlay-drawing) batch
+on the present queue that waits on the app's present semaphores and signals
+a per-image semaphore and fence, waits for that fence on the CPU (100 ms
+timeout, then carries on), and only then sleeps/spins to the deadline and
+presents on its already-signalled semaphore. The deadline grid is as in
+MangoHud's `early` method: it advances by `1e9/cap` per frame; if the frame
+is more than one interval late the grid resyncs to now; otherwise
+`clock_nanosleep` to `deadline - 300us`, then spin. A cap change restarts the
+grid from the last present time, so there is no jump. With `cap <= 0` there
+is no wait at all (a relay submit is only made when the overlay is drawn).
 
 ## Overlay
 
@@ -104,15 +114,17 @@ added at swapchain creation (if the surface supports it). Per swapchain the
 layer creates a render pass (LOAD/STORE, PRESENT_SRC to PRESENT_SRC), an
 alpha-blended pipeline, and per image a framebuffer, command buffer, fence,
 semaphore and a host-visible vertex buffer. Each present submits the overlay
-(waiting on the app's present semaphores) and presents on the overlay's
-semaphore. Any failure disables the overlay for that swapchain only.
+as part of the relay submit described above. Any failure disables the overlay for that swapchain only.
 Text is an embedded 5x7 font, one quad per lit pixel, scaled to about
 `height/480` px per font pixel.
 
 ## Known limitations
 
-- Overlay is drawn only for presents with a single swapchain, on a queue
-  family with GRAPHICS.
+- Relay and overlay apply only to presents with a single swapchain (others
+  pass through untouched, with no limiter relay); the overlay also needs a
+  queue family with GRAPHICS.
+- While limiting, the present thread blocks on the GPU for each frame, so
+  the CPU cannot run ahead of the GPU by the usual frame(s).
 - Overlay resources are created on the first present of a swapchain (the
   present queue is not known at swapchain creation), so the first frame
   after (re)creation pays a one-off setup cost.
