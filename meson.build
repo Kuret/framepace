@@ -69,3 +69,22 @@ subdir('dev')
 test_color = executable('test_color', 'tests/test_color.c', 'src/color.c',
   dependencies : [cc.find_library('m')])
 test('color encoding', test_color)
+
+# Manual HDR swapchain harness (needs a Wayland session): `ninja -C build hdr_swapchain`.
+# Not built by default, and skipped when the Wayland development files are missing.
+wl_client = dependency('wayland-client', required : false)
+wl_protocols = dependency('wayland-protocols', required : false)
+wl_scanner = find_program('wayland-scanner', required : false)
+vulkan_lib = cc.find_library('vulkan', required : false)
+if wl_client.found() and wl_protocols.found() and wl_scanner.found() and vulkan_lib.found()
+  xdg_xml = wl_protocols.get_variable('pkgdatadir') / 'stable' / 'xdg-shell' / 'xdg-shell.xml'
+  xdg_code = custom_target('xdg-shell-protocol-c',
+    input : xdg_xml, output : 'xdg-shell-protocol.c',
+    command : [wl_scanner, 'private-code', '@INPUT@', '@OUTPUT@'])
+  xdg_header = custom_target('xdg-shell-client-protocol-h',
+    input : xdg_xml, output : 'xdg-shell-client-protocol.h',
+    command : [wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
+  executable('hdr_swapchain', 'tests/hdr_swapchain.c', xdg_code, xdg_header,
+    dependencies : [wl_client, vulkan_lib],
+    build_by_default : false)
+endif
