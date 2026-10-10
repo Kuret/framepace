@@ -29,3 +29,22 @@ layer = shared_library('VkLayer_framepace',
   name_prefix : 'lib',
   install : true,
   install_dir : get_option('prefix') / 'lib' / 'framepace')
+
+# Installed manifest: absolute library_path, mirrors MangoHud's layout so that
+# Steam's pressure-vessel imports it and remaps the host path.
+
+lib_install_dir = get_option('prefix') / 'lib' / 'framepace'
+manifest_name = 'framepace.x86_64.json'
+
+install_conf = configuration_data()
+install_conf.set('LIBRARY_PATH', lib_install_dir / 'libVkLayer_framepace.so')
+configure_file(
+  input : 'manifest/framepace.json.in',
+  output : manifest_name,
+  configuration : install_conf,
+  install : true,
+  install_dir : get_option('prefix') / 'share' / 'vulkan' / 'implicit_layer.d')
+
+# Development manifest pointing at the build output, for
+# VK_ADD_IMPLICIT_LAYER_PATH=<builddir>/dev before installing.
+subdir('dev')
