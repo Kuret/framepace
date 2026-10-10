@@ -19,19 +19,26 @@ static bool env_true(const char *name)
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
-/* Exact match of a process name against entry[0..len). /proc/self/comm is
- * truncated to 15 characters, so a longer entry also matches a 15-char comm
- * that is its prefix. */
-static bool name_matches(const char *name, const char *entry, size_t len)
+/* Match a process name against pattern[0..len): exact, or a prefix match when
+ * the pattern ends in '*'. /proc/self/comm is truncated to 15 characters, so a
+ * pattern longer than that also matches a 15-char comm that is its prefix. */
+static bool name_matches(const char *name, const char *pattern, size_t len)
 {
     size_t n = strlen(name);
     if (len == 0)
         return false;
-    if (n == len && memcmp(name, entry, len) == 0)
+    if (pattern[len - 1] == '*') {
+        size_t p = len - 1;                 /* literal prefix, may be empty ("*") */
+        if (n >= p && memcmp(name, pattern, p) == 0)
+            return true;
+        return n == 15 && p > 15 && memcmp(name, pattern, 15) == 0;
+    }
+    if (n == len && memcmp(name, pattern, len) == 0)
         return true;
-    return n == 15 && len > 15 && memcmp(name, entry, 15) == 0;
+    return n == 15 && len > 15 && memcmp(name, pattern, 15) == 0;
 }
 
+/* Comma-separated list of names/patterns. */
 static bool in_list(const char *name, const char *list)
 {
     while (list && *list) {
@@ -48,6 +55,24 @@ static bool in_list(const char *name, const char *list)
         list = end + 1;
     }
     return false;
+}
+
+/* Processes that are never limited even with a game's environment: gamescope
+ * (it limits itself), the Steam client, and launcher helpers that carry the
+ * game's Steam/umu environment and may create a Vulkan device (umu's python,
+ * Steam Runtime and pressure-vessel tools). A trailing '*' is a prefix match. */
+static const char *const builtin_deny =
+    "gamescope,gamescopereaper,steamwebhelper,steam,"
+    "python*,srt-*,steam-runtime-*,pressure-vessel*,pv-*,vulkaninfo";
+
+bool fp_gate_list_matches(const char *name, const char *list)
+{
+    return in_list(name, list);
+}
+
+bool fp_gate_builtin_denied(const char *name)
+{
+    return in_list(name, builtin_deny);
 }
 
 static void read_names(char *comm, size_t csz, char *exe, size_t esz)
@@ -75,8 +100,6 @@ static void read_names(char *comm, size_t csz, char *exe, size_t esz)
 
 static void decide(void)
 {
-    static const char *const deny[] = { "gamescope", "gamescopereaper", "steamwebhelper",
-                                        "steam", NULL };
     static const char *const game_env[] = { "SteamGameId", "SteamAppId", "STEAM_COMPAT_APP_ID",
                                             "STEAM_COMPAT_DATA_PATH", "WINEPREFIX",
                                             "WINELOADERNOEXEC", "WINEDEBUG", "UMU_ID", NULL };
@@ -98,16 +121,14 @@ static void decide(void)
         snprintf(g_reason, sizeof g_reason, "inactive: DISABLE_FRAMEPACE is set");
         return;
     }
-    for (int i = 0; deny[i]; i++) {
-        if (name_matches(comm, deny[i], strlen(deny[i])) ||
-            name_matches(exe, deny[i], strlen(deny[i]))) {
-            snprintf(g_reason, sizeof g_reason, "inactive: process '%s' is never limited", deny[i]);
-            return;
-        }
+    if (fp_gate_builtin_denied(comm) || fp_gate_builtin_denied(exe)) {
+        snprintf(g_reason, sizeof g_reason, "inactive: process '%.60s' is never limited (launcher or runtime helper)",
+                 fp_gate_builtin_denied(comm) ? comm : exe);
+        return;
     }
     const char *user = getenv("FRAMEPACE_DENY");
     if (user && (in_list(comm, user) || in_list(exe, user))) {
-        snprintf(g_reason, sizeof g_reason, "inactive: process '%s' is in FRAMEPACE_DENY",
+        snprintf(g_reason, sizeof g_reason, "inactive: process '%.60s' is in FRAMEPACE_DENY",
                  in_list(comm, user) ? comm : exe);
         return;
     }
@@ -137,7 +158,7 @@ static void decide(void)
         }
     }
     snprintf(g_reason, sizeof g_reason,
-             "inactive: '%s' does not look like a game (no Steam/Wine/Proton environment; "
+             "inactive: '%.60s' does not look like a game (no Steam/Wine/Proton environment; "
              "set FRAMEPACE_FORCE=1 to force)", comm[0] ? comm : exe);
 }
 

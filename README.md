@@ -276,10 +276,20 @@ loader (`wine`, `wine64`, `wine-preloader`, `wine64-preloader`). Proton, Wine, L
 umu, Heroic, Bottles and Faugus all export at least one of these. Native games that are
 not launched through Steam need `FRAMEPACE_FORCE=1`.
 
-It is **never** active in `gamescope`, `gamescopereaper`, `steamwebhelper` or `steam`
-(matched on `/proc/self/comm` and the executable name), nor in names listed in
-`FRAMEPACE_DENY` (comma-separated). This avoids double limiting inside gamescope and
-touching launchers. The deny list wins over `FRAMEPACE_FORCE`.
+It is **never** active in these processes, even with a game's environment (names are
+matched on `/proc/self/comm` and the executable's basename; a trailing `*` is a prefix
+wildcard):
+
+- `gamescope`, `gamescopereaper` (gamescope limits by itself),
+- `steam`, `steamwebhelper` (the Steam client),
+- launcher and runtime helpers that inherit the game's Steam/umu environment and can
+  create a Vulkan device: `python*` (umu's launcher), `srt-*`, `steam-runtime-*`,
+  `pressure-vessel*`, `pv-*`, `vulkaninfo`,
+- anything listed in `FRAMEPACE_DENY` (comma-separated, same `*` wildcard, e.g.
+  `FRAMEPACE_DENY=mylauncher-*,foo`).
+
+The deny list wins over `FRAMEPACE_FORCE`. A game that is itself a Python program is
+therefore never limited by the built-in `python*` entry.
 
 | Variable | Effect |
 |---|---|

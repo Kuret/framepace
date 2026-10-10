@@ -13,3 +13,9 @@ const char *fp_gate_reason(void);   /* why, for FRAMEPACE_DEBUG */
  * /proc/self/exe and whether it is a Wine loader. */
 const char *fp_gate_exe_name(void);
 bool fp_gate_exe_is_wine(void);
+
+/* Name matching used for the deny lists (exposed for tests): the name matches
+ * when it equals a comma-separated entry, or starts with it when the entry ends
+ * in '*'. */
+bool fp_gate_list_matches(const char *name, const char *list);
+bool fp_gate_builtin_denied(const char *name);

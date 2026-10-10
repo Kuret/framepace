@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "../src/game.h"
+#include "../src/gate.h"
 
 static int failures;
 
@@ -57,6 +58,32 @@ int main(void)
     key_with("umu hash ignored", NULL, NULL, "umu-abc123", "test_game");
     key_with("zero then game id", "0", "55", NULL, "steam-55");
     key_with("not purely numeric", "12a", NULL, NULL, "test_game");
+
+    /* deny matching: exact entries, trailing-* prefixes, FRAMEPACE_DENY lists */
+    check_int("deny gamescope", fp_gate_builtin_denied("gamescope"), 1);
+    check_int("deny gamescopereaper", fp_gate_builtin_denied("gamescopereaper"), 1);
+    check_int("deny steam", fp_gate_builtin_denied("steam"), 1);
+    check_int("steamx not denied (exact entry)", fp_gate_builtin_denied("steamx"), 0);
+    check_int("deny python3.14", fp_gate_builtin_denied("python3.14"), 1);
+    check_int("deny python", fp_gate_builtin_denied("python"), 1);
+    check_int("deny srt-launcher", fp_gate_builtin_denied("srt-logger"), 1);
+    check_int("deny steam-runtime-launch-client (comm-truncated)",
+              fp_gate_builtin_denied("steam-runtime-l"), 1);
+    check_int("deny pressure-vessel-wrap", fp_gate_builtin_denied("pressure-vessel-wrap"), 1);
+    check_int("deny pv-adverb", fp_gate_builtin_denied("pv-adverb"), 1);
+    check_int("deny vulkaninfo", fp_gate_builtin_denied("vulkaninfo"), 1);
+    check_int("vkcube allowed", fp_gate_builtin_denied("vkcube"), 0);
+    check_int("Wow.exe allowed", fp_gate_builtin_denied("Wow.exe"), 0);
+    check_int("pythonic game is denied by the prefix", fp_gate_builtin_denied("pythonista"), 1);
+    check_int("py not denied", fp_gate_builtin_denied("py"), 0);
+    check_int("pv alone not denied", fp_gate_builtin_denied("pv"), 0);
+    check_int("user list exact", fp_gate_list_matches("foo", "bar, foo ,baz"), 1);
+    check_int("user list miss", fp_gate_list_matches("foobar", "bar,foo"), 0);
+    check_int("user list prefix", fp_gate_list_matches("foobar", "bar,foo*"), 1);
+    check_int("user list empty", fp_gate_list_matches("foo", ""), 0);
+    check_int("user list lone star", fp_gate_list_matches("anything", "*"), 1);
+    check_int("long entry vs 15-char comm", fp_gate_list_matches("verylongprocess1", "verylongprocess1234"), 0);
+    check_int("long entry matches truncated comm", fp_gate_list_matches("verylongprocess", "verylongprocess1234"), 1);
 
     char line[128], *k, *v;
     strcpy(line, "  Mode =  adaptive  # comment");
