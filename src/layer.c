@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "dispatch.h"
+#include "limiter.h"
 #include "state.h"
 #include "util.h"
 
@@ -63,7 +64,7 @@ static void track_queue(fp_device *dev, VkQueue q, uint32_t family)
 /* Find the device owning a queue by handle (the loader may not have stamped
  * the dispatch pointer yet when we first saw it, so handles are the primary
  * key) and fall back to the dispatch key. */
-static __attribute__((unused)) fp_device *device_from_queue(VkQueue q, uint32_t *family_out)
+static fp_device *device_from_queue(VkQueue q, uint32_t *family_out)
 {
     fp_device *found = NULL;
     uint32_t fam = UINT32_MAX;
@@ -274,6 +275,42 @@ static VKAPI_ATTR void VKAPI_CALL fp_DestroyDevice(VkDevice device,
     next(device, pAllocator);
 }
 
+/* ---- present ------------------------------------------------------------- */
+
+static pthread_mutex_t g_stat_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_prev_present_ns;   /* previous frame's hand-down time */
+static uint64_t g_prev_return_ns;    /* when the previous present returned */
+
+static VKAPI_ATTR VkResult VKAPI_CALL fp_QueuePresentKHR(VkQueue queue,
+                                                         const VkPresentInfoKHR *pPresentInfo)
+{
+    uint64_t entry_ns = fp_now_ns();
+    uint32_t family;
+    fp_device *dev = device_from_queue(queue, &family);
+    if (!dev)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!g_fp_state)
+        return dev->t.QueuePresentKHR(queue, pPresentInfo);   /* pure passthrough */
+
+    VkPresentInfoKHR present = *pPresentInfo;
+
+    /* Limiter: after the overlay has been submitted, before handing down. */
+    uint64_t present_ns = fp_limiter_wait(fp_state_cap());
+
+    VkResult res = dev->t.QueuePresentKHR(queue, &present);
+    uint64_t return_ns = fp_now_ns();
+
+    pthread_mutex_lock(&g_stat_lock);
+    uint32_t frame_ns = g_prev_present_ns ? (uint32_t)(present_ns - g_prev_present_ns) : 0;
+    uint32_t work_ns = g_prev_return_ns && entry_ns > g_prev_return_ns
+                           ? (uint32_t)(entry_ns - g_prev_return_ns) : 0;
+    g_prev_present_ns = present_ns;
+    g_prev_return_ns = return_ns;
+    fp_state_record(present_ns, frame_ns, work_ns);
+    pthread_mutex_unlock(&g_stat_lock);
+    return res;
+}
+
 /* ---- proc-addr dispatch -------------------------------------------------- */
 
 #define HOOK_INSTANCE(n) if (!strcmp(name, "vk" #n)) return (PFN_vkVoidFunction)fp_##n
@@ -287,6 +324,7 @@ static PFN_vkVoidFunction device_hook(const char *name)
     HOOK_DEVICE(DestroyDevice);
     HOOK_DEVICE(GetDeviceQueue);
     HOOK_DEVICE(GetDeviceQueue2);
+    HOOK_DEVICE(QueuePresentKHR);
     return NULL;
 }
 
