@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "game.h"
 #include "util.h"
 
 struct fp_state *g_fp_state;
@@ -45,6 +46,35 @@ static void on_exit_cleanup(void)
 {
     /* Games often exit without destroying their device. */
     remove_file();
+}
+
+/* Game key and saved settings (falling back to the global defaults) decide the
+ * starting cap, mode and overlay, so a game starts as the user left it. */
+static void init_from_settings(struct fp_state *s)
+{
+    char key[FP_GAME_LEN];
+    struct fp_settings set;
+    fp_game_key(key, sizeof key);
+    fp_settings_load(key, &set);
+    memcpy(s->game, key, sizeof s->game);
+    s->flags = set.overlay ? FP_FLAG_OVERLAY : 0;
+    switch (set.mode) {
+    case FP_MODE_OFF:
+        s->cap = 0;
+        s->flags |= FP_FLAG_MANUAL;
+        break;
+    case FP_MODE_MANUAL:
+        s->cap = set.cap;
+        s->flags |= FP_FLAG_MANUAL;
+        break;
+    default:
+        /* Without a remembered value and a fixed MAX_CAP the layer cannot know
+         * the monitor's refresh rate: start uncapped and let the daemon set it. */
+        s->cap = set.last_adaptive > 0 ? set.last_adaptive : set.max_cap;
+        s->flags |= FP_FLAG_ADAPTIVE;
+        break;
+    }
+    fp_log("game %s: mode %d, cap %d, overlay %d", key, set.mode, s->cap, set.overlay);
 }
 
 static void create_run_file(void)
@@ -86,9 +116,8 @@ static void create_run_file(void)
     struct fp_state *s = m;
     memset(s, 0, sizeof *s);
     s->version = FP_STATE_VERSION;
-    s->cap = 0;
-    s->flags = FP_FLAG_OVERLAY;
     s->pid = (uint32_t)getpid();
+    init_from_settings(s);
     g_owner = getpid();
     __atomic_store_n(&s->magic, FP_STATE_MAGIC, __ATOMIC_RELEASE);
     g_fp_state = s;

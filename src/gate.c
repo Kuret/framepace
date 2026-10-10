@@ -10,6 +10,8 @@
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 static bool g_active;
 static char g_reason[192];
+static char g_exe[256];
+static bool g_exe_wine;
 
 static bool env_true(const char *name)
 {
@@ -82,6 +84,10 @@ static void decide(void)
                                               "wine", NULL };
     char comm[64], exe[256];
     read_names(comm, sizeof comm, exe, sizeof exe);
+    memcpy(g_exe, exe, sizeof g_exe);
+    for (int i = 0; wine_names[i]; i++)
+        if (strcmp(exe, wine_names[i]) == 0)
+            g_exe_wine = true;
 
     const char *fp = getenv("FRAMEPACE");
     if (fp && strcmp(fp, "0") == 0) {
@@ -145,4 +151,16 @@ const char *fp_gate_reason(void)
 {
     pthread_once(&g_once, decide);
     return g_reason;
+}
+
+const char *fp_gate_exe_name(void)
+{
+    pthread_once(&g_once, decide);
+    return g_exe;
+}
+
+bool fp_gate_exe_is_wine(void)
+{
+    pthread_once(&g_once, decide);
+    return g_exe_wine;
 }

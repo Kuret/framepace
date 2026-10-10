@@ -8,3 +8,8 @@
  */
 bool fp_gate_active(void);
 const char *fp_gate_reason(void);   /* why, for FRAMEPACE_DEBUG */
+
+/* Process identity, valid after fp_gate_active(): the basename of
+ * /proc/self/exe and whether it is a Wine loader. */
+const char *fp_gate_exe_name(void);
+bool fp_gate_exe_is_wine(void);
