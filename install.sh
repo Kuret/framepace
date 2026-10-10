@@ -209,15 +209,33 @@ EOT
     say "    FRAMEPACE=1 %command%"
 }
 
+# Appends "KEY = VALUE" (with a comment) to an existing config unless the key is already set.
+ensure_key() {
+    cfg="$1"; key="$2"; value="$3"; note="$4"
+    if grep -Eqi "^[[:space:]]*${key}[[:space:]]*=" "$cfg"; then
+        return 0
+    fi
+    say "adding $key = $value to $cfg"
+    if [ "$DRY_RUN" = 1 ]; then
+        printf '  [dry-run] append %s = %s\n' "$key" "$value"
+        return 0
+    fi
+    printf '\n# Added by the framepace installer: %s\n%s = %s\n' "$note" "$key" "$value" >>"$cfg"
+}
+
 write_config() {
     step "Configuration"
-    cfg="$CONFIG_HOME/framepace/config"
+    # The layer and fps-cap read $HOME/.config/framepace (per-game settings live in games/).
+    cfg="$HOME/.config/framepace/config"
     if [ -e "$cfg" ]; then
         say "keeping existing $cfg"
+        ensure_key "$cfg" DEFAULT_MODE adaptive "mode for games without saved settings (adaptive, manual or off)"
+        ensure_key "$cfg" DEFAULT_OVERLAY on "overlay for games without saved settings (on or off)"
         return 0
     fi
     write_file "$cfg" <<'EOT'
 # framepace / fps-cap configuration. "key = value", '#' starts a comment.
+# Per-game settings (mode, cap, overlay) are saved by fps-cap in ~/.config/framepace/games/<game>.conf.
 
 # Lowest cap that fps-cap will set. Put it just above your monitor's VRR floor
 # (many panels drop out of VRR below ~48 Hz).
@@ -229,6 +247,12 @@ MAX_CAP = 0
 
 # The adaptive cap is 1000 / (tail frame work time * MARGIN).
 MARGIN = 1.05
+
+# Mode for games without saved settings: adaptive, manual or off (no cap).
+DEFAULT_MODE = adaptive
+
+# Overlay for games without saved settings: on or off.
+DEFAULT_OVERLAY = on
 
 # Hyprland only: pause adapting while the active window is not fullscreen.
 PAUSE_WHEN_NOT_FULLSCREEN = yes
@@ -284,7 +308,8 @@ next_steps() {
        bindsym F12 exec fps-cap overlay toggle
    KDE: System Settings > Shortcuts > Add Command; GNOME: Settings > Keyboard > Custom Shortcuts.
    Use the full path ~/.local/bin/fps-cap there if your desktop does not have it on PATH.
-Edit ~/.config/framepace/config to tune MIN_CAP, MAX_CAP and MARGIN. Uninstall: uninstall.sh.
+Each game remembers its own mode, cap and overlay (see: fps-cap list). Edit ~/.config/framepace/config to tune
+MIN_CAP, MAX_CAP, MARGIN and the defaults for new games. Uninstall: uninstall.sh.
 EOT
 }
 
