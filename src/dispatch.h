@@ -77,6 +77,7 @@ typedef struct fp_device_table {
 } fp_device_table;
 
 struct fp_overlay;
+struct fp_relay;
 
 typedef struct fp_swapchain {
     struct fp_swapchain *next;
@@ -86,6 +87,8 @@ typedef struct fp_swapchain {
     bool usage_ok;            /* COLOR_ATTACHMENT was added (or already present) */
     int ov_state;             /* 0 = not tried, 1 = ready, 2 = disabled */
     struct fp_overlay *ov;
+    int relay_state;          /* same encoding */
+    struct fp_relay *relay;
 } fp_swapchain;
 
 typedef struct fp_instance {

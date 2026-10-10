@@ -356,8 +356,10 @@ fp_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateIn
 
 static void release_swapchain(fp_device *dev, fp_swapchain *sc)
 {
+    fp_relay_idle(dev, sc->relay);      /* nothing may still read our buffers */
     if (sc->ov)
         fp_overlay_destroy(dev, sc->ov);
+    fp_relay_destroy(dev, sc->relay);
     free(sc);
 }
 
@@ -383,6 +385,9 @@ fp_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
 
 /* ---- present ------------------------------------------------------------- */
 
+#define RELAY_REUSE_TIMEOUT_NS  2000000ull    /* 2 ms: else skip the relay this frame */
+#define RELAY_RENDER_TIMEOUT_NS 100000000ull  /* 100 ms: else carry on */
+
 static pthread_mutex_t g_stat_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_prev_present_ns;   /* previous frame's hand-down time */
 static uint64_t g_prev_return_ns;    /* when the previous present returned */
@@ -399,52 +404,86 @@ static VKAPI_ATTR VkResult VKAPI_CALL fp_QueuePresentKHR(VkQueue queue,
         return dev->t.QueuePresentKHR(queue, pPresentInfo);   /* pure passthrough */
 
     VkPresentInfoKHR present = *pPresentInfo;
-    VkSemaphore overlay_sem = VK_NULL_HANDLE;
+    VkSemaphore relay_sem = VK_NULL_HANDLE;
+    uint64_t rendered_ns = 0;   /* when our relay fence signalled (0 = unknown) */
 
-    /* Overlay: draw into the image being presented. Only for the common
-     * single-swapchain present (binary wait semaphores can be waited once). */
-    if ((fp_state_flags() & FP_FLAG_OVERLAY) && pPresentInfo->swapchainCount == 1 &&
-        family < dev->nfamilies && (dev->family_flags[family] & VK_QUEUE_GRAPHICS_BIT)) {
+    const int32_t cap = fp_state_cap();
+    const bool want_overlay = (fp_state_flags() & FP_FLAG_OVERLAY) &&
+                              family < dev->nfamilies &&
+                              (dev->family_flags[family] & VK_QUEUE_GRAPHICS_BIT);
+
+    /*
+     * Relay submit (single-swapchain presents only: binary wait semaphores can
+     * be waited once). It waits on the app's semaphores, draws the overlay if
+     * on, and signals our semaphore + fence. When limiting, we block on the
+     * fence so the frame is actually rendered before we sleep to the deadline;
+     * the present then goes out on an already-signalled semaphore.
+     */
+    if (pPresentInfo->swapchainCount == 1 && (cap > 0 || want_overlay)) {
         pthread_mutex_lock(&dev->lock);
         fp_swapchain *sc = find_swapchain(dev, pPresentInfo->pSwapchains[0]);
-        int state = sc ? sc->ov_state : 2;
+        int rstate = sc ? sc->relay_state : 2;
         pthread_mutex_unlock(&dev->lock);
-        if (sc && state != 2) {
-            if (state == 0) {
-                struct fp_overlay *ov = fp_overlay_create(dev, sc, family);
-                pthread_mutex_lock(&dev->lock);
-                sc->ov = ov;
-                sc->ov_state = ov ? 1 : 2;
-                pthread_mutex_unlock(&dev->lock);
-                fp_log(ov ? "overlay enabled for swapchain %ux%u"
-                          : "overlay disabled for swapchain %ux%u: resource creation failed",
-                       sc->extent.width, sc->extent.height);
-            }
-            if (sc->ov) {
-                bool broken = false;
-                if (fp_overlay_draw(dev, sc->ov, queue, pPresentInfo->pImageIndices[0],
-                                    pPresentInfo->waitSemaphoreCount,
-                                    pPresentInfo->pWaitSemaphores, &overlay_sem, &broken)) {
-                    present.waitSemaphoreCount = 1;
-                    present.pWaitSemaphores = &overlay_sem;
-                } else if (broken) {
-                    sc->ov_state = 2;   /* keep the resources, stop drawing */
-                    fp_log("overlay disabled for swapchain: submission failed");
+
+        if (sc && rstate == 0) {
+            struct fp_relay *r = fp_relay_create(dev, sc);
+            pthread_mutex_lock(&dev->lock);
+            sc->relay = r;
+            sc->relay_state = rstate = r ? 1 : 2;
+            pthread_mutex_unlock(&dev->lock);
+            if (!r)
+                fp_log("relay unavailable for swapchain %ux%u", sc->extent.width,
+                       sc->extent.height);
+        }
+        const uint32_t idx = pPresentInfo->pImageIndices[0];
+        if (sc && rstate == 1 && fp_relay_acquire(dev, sc->relay, idx, RELAY_REUSE_TIMEOUT_NS)) {
+            VkCommandBuffer cb = VK_NULL_HANDLE;
+            if (want_overlay && sc->usage_ok && sc->ov_state != 2) {
+                if (sc->ov_state == 0) {
+                    struct fp_overlay *ov = fp_overlay_create(dev, sc, family);
+                    pthread_mutex_lock(&dev->lock);
+                    sc->ov = ov;
+                    sc->ov_state = ov ? 1 : 2;
+                    pthread_mutex_unlock(&dev->lock);
+                    fp_log(ov ? "overlay enabled for swapchain %ux%u"
+                              : "overlay disabled for swapchain %ux%u: resource creation failed",
+                           sc->extent.width, sc->extent.height);
                 }
+                if (sc->ov) {
+                    bool broken = false;
+                    if (!fp_overlay_record(dev, sc->ov, idx, &cb, &broken) && broken) {
+                        sc->ov_state = 2;
+                        fp_log("overlay disabled for swapchain: recording failed");
+                    }
+                }
+            }
+            bool broken = false;
+            if (fp_relay_submit(dev, sc->relay, queue, idx, pPresentInfo->waitSemaphoreCount,
+                                pPresentInfo->pWaitSemaphores, cb, &relay_sem, &broken)) {
+                present.waitSemaphoreCount = 1;
+                present.pWaitSemaphores = &relay_sem;
+                if (cap > 0 && fp_relay_wait(dev, sc->relay, idx, RELAY_RENDER_TIMEOUT_NS))
+                    rendered_ns = fp_now_ns();
+            } else if (broken) {
+                sc->relay_state = 2;
+                fp_log("relay disabled for swapchain: submission failed");
             }
         }
     }
 
-    /* Limiter: after the overlay has been submitted, before handing down. */
-    uint64_t present_ns = fp_limiter_wait(fp_state_cap());
+    /* Limiter: only now, with the frame rendered, sleep/spin to the deadline. */
+    uint64_t present_ns = fp_limiter_wait(cap);
 
     VkResult res = dev->t.QueuePresentKHR(queue, &present);
     uint64_t return_ns = fp_now_ns();
 
     pthread_mutex_lock(&g_stat_lock);
     uint32_t frame_ns = g_prev_present_ns ? (uint32_t)(present_ns - g_prev_present_ns) : 0;
-    uint32_t work_ns = g_prev_return_ns && entry_ns > g_prev_return_ns
-                           ? (uint32_t)(entry_ns - g_prev_return_ns) : 0;
+    /* work = previous present returned -> frame rendered (CPU + GPU time),
+     * or -> this present call when we did not wait for the GPU. */
+    uint64_t work_end = rendered_ns ? rendered_ns : entry_ns;
+    uint32_t work_ns = g_prev_return_ns && work_end > g_prev_return_ns
+                           ? (uint32_t)(work_end - g_prev_return_ns) : 0;
     g_prev_present_ns = present_ns;
     g_prev_return_ns = return_ns;
     fp_state_record(present_ns, frame_ns, work_ns);

@@ -29,6 +29,7 @@ layer_sources = files(
   'src/limiter.c',
   'src/overlay.c',
   'src/panel.c',
+  'src/relay.c',
   'src/state.c',
   'src/util.c',
 )

@@ -14,14 +14,11 @@
 #include "panel.h"
 #include "util.h"
 
-#define FENCE_TIMEOUT_NS 2000000ull   /* 2 ms: skip the overlay rather than stall */
 
 struct ov_image {
     VkImageView view;
     VkFramebuffer fb;
     VkCommandBuffer cb;
-    VkFence fence;
-    VkSemaphore sem;
     VkBuffer buf;
     VkDeviceMemory mem;
     fp_vertex *map;
@@ -66,12 +63,6 @@ void fp_overlay_destroy(fp_device *dev, struct fp_overlay *ov)
     const fp_device_table *t = &dev->t;
     VkDevice d = dev->handle;
 
-    /* Make sure no submission still reads our buffers. Fences start signalled
-     * and are only reset right before a submit, so this cannot hang for long. */
-    for (uint32_t i = 0; i < ov->nimages; i++)
-        if (ov->img[i].fence)
-            t->WaitForFences(d, 1, &ov->img[i].fence, VK_TRUE, 1000000000ull);
-
     for (uint32_t i = 0; i < ov->nimages; i++) {
         struct ov_image *im = &ov->img[i];
         if (im->map)
@@ -80,10 +71,6 @@ void fp_overlay_destroy(fp_device *dev, struct fp_overlay *ov)
             t->DestroyBuffer(d, im->buf, NULL);
         if (im->mem)
             t->FreeMemory(d, im->mem, NULL);
-        if (im->sem)
-            t->DestroySemaphore(d, im->sem, NULL);
-        if (im->fence)
-            t->DestroyFence(d, im->fence, NULL);
         if (im->fb)
             t->DestroyFramebuffer(d, im->fb, NULL);
         if (im->view)
@@ -203,14 +190,6 @@ static bool create_image_resources(fp_device *dev, struct fp_overlay *ov, const 
     if (t->CreateFramebuffer(d, &fbci, NULL, &im->fb) != VK_SUCCESS)
         return false;
 
-    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                              .flags = VK_FENCE_CREATE_SIGNALED_BIT };
-    if (t->CreateFence(d, &fci, NULL, &im->fence) != VK_SUCCESS)
-        return false;
-    VkSemaphoreCreateInfo sci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    if (t->CreateSemaphore(d, &sci, NULL, &im->sem) != VK_SUCCESS)
-        return false;
-
     VkCommandBufferAllocateInfo cbai = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = ov->pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
@@ -310,25 +289,14 @@ fail:
     return NULL;
 }
 
-bool fp_overlay_draw(fp_device *dev, struct fp_overlay *ov, VkQueue queue,
-                     uint32_t image_index, uint32_t wait_count,
-                     const VkSemaphore *waits, VkSemaphore *out_sem, bool *broken)
+bool fp_overlay_record(fp_device *dev, struct fp_overlay *ov, uint32_t idx,
+                       VkCommandBuffer *out_cb, bool *broken)
 {
     const fp_device_table *t = &dev->t;
-    VkDevice d = dev->handle;
     *broken = false;
-    if (image_index >= ov->nimages)
+    if (idx >= ov->nimages)
         return false;
-    struct ov_image *im = &ov->img[image_index];
-
-    /* The previous use of this image's command buffer / vertex buffer must be done. */
-    VkResult r = t->WaitForFences(d, 1, &im->fence, VK_TRUE, FENCE_TIMEOUT_NS);
-    if (r == VK_TIMEOUT)
-        return false;
-    if (r != VK_SUCCESS) {
-        *broken = true;
-        return false;
-    }
+    struct ov_image *im = &ov->img[idx];
 
     uint32_t nverts = fp_panel_build(im->map, FP_MAX_VERTS, ov->extent.width,
                                      ov->extent.height, ov->srgb, &ov->cache);
@@ -362,34 +330,6 @@ bool fp_overlay_draw(fp_device *dev, struct fp_overlay *ov, VkQueue queue,
         *broken = true;
         return false;
     }
-
-    VkPipelineStageFlags stage_buf[16];
-    VkPipelineStageFlags *stages = stage_buf;
-    if (wait_count > 16) {
-        stages = malloc(wait_count * sizeof *stages);
-        if (!stages)
-            return false;
-    }
-    for (uint32_t i = 0; i < wait_count; i++)
-        stages[i] = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        .waitSemaphoreCount = wait_count, .pWaitSemaphores = waits,
-                        .pWaitDstStageMask = stages,
-                        .commandBufferCount = 1, .pCommandBuffers = &im->cb,
-                        .signalSemaphoreCount = 1, .pSignalSemaphores = &im->sem };
-    bool ok = false;
-    if (t->ResetFences(d, 1, &im->fence) == VK_SUCCESS) {
-        if (t->QueueSubmit(queue, 1, &si, im->fence) == VK_SUCCESS) {
-            *out_sem = im->sem;
-            ok = true;
-        } else {
-            *broken = true;
-        }
-    } else {
-        *broken = true;
-    }
-    if (stages != stage_buf)
-        free(stages);
-    return ok;
+    *out_cb = im->cb;
+    return true;
 }
