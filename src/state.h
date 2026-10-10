@@ -1,14 +1,17 @@
 #pragma once
 /*
- * Shared state file: the runtime control channel between the layer and
- * external tools. Little-endian, packed, version 1. See README.md.
+ * Per-process live state file: the runtime control channel between the layer
+ * and external tools, one file per active game process at
+ * $HOME/.local/state/framepace/run/<pid>.state. Little-endian, version 2.
+ * See README.md.
  */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 
 #define FP_STATE_MAGIC   0x43415046u   /* 'F','P','A','C' */
-#define FP_STATE_VERSION 1u
+#define FP_STATE_VERSION 2u
+#define FP_GAME_LEN      64
 #define FP_RING_SIZE     256
 
 #define FP_FLAG_OVERLAY  (1u << 0)
@@ -29,20 +32,27 @@ struct fp_state {
     uint64_t seq;          /* total frames presented (layer writes, after ring) */
     uint32_t head;         /* index of the most recent ring entry (layer writes) */
     uint32_t pid;          /* pid of the process writing frames (layer writes) */
+    uint64_t last_present_ns;       /* CLOCK_MONOTONIC of the latest present (layer writes) */
+    char     game[FP_GAME_LEN];     /* game key, NUL-terminated (written once at creation) */
     struct fp_frame ring[FP_RING_SIZE];
 };
 
 _Static_assert(sizeof(struct fp_frame) == 16, "fp_frame layout");
 _Static_assert(offsetof(struct fp_state, seq) == 16, "fp_state layout");
-_Static_assert(offsetof(struct fp_state, ring) == 32, "fp_state layout");
-_Static_assert(sizeof(struct fp_state) == 32 + 16 * FP_RING_SIZE, "fp_state layout");
+_Static_assert(offsetof(struct fp_state, last_present_ns) == 32, "fp_state layout");
+_Static_assert(offsetof(struct fp_state, game) == 40, "fp_state layout");
+_Static_assert(offsetof(struct fp_state, ring) == 104, "fp_state layout");
+_Static_assert(sizeof(struct fp_state) == 104 + 16 * FP_RING_SIZE, "fp_state layout");
 
-/* Mapped state, or NULL when the file could not be opened (layer is then a
- * pure passthrough). */
+/* Mapped state of this process, or NULL when there is none (the layer is
+ * then a pure passthrough). */
 extern struct fp_state *g_fp_state;
 
-/* Open + map the state file once per process. Safe to call repeatedly. */
-bool fp_state_open(void);
+/* Create this process's run file (first call) and map it. Reference counted:
+ * call once per device created while the layer is active. */
+bool fp_state_acquire(void);
+/* Drop one reference; at zero the file is unmapped and deleted. */
+void fp_state_release(void);
 
 /* Relaxed reads of the control fields. */
 int32_t  fp_state_cap(void);

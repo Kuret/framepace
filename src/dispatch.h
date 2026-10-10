@@ -106,6 +106,7 @@ typedef struct fp_device {
     fp_instance *inst;
     fp_device_table t;
     PFN_vkSetDeviceLoaderData set_loader_data;
+    bool holds_state;         /* took a reference on the run file */
 
     uint32_t nfamilies;
     VkQueueFlags family_flags[FP_MAX_FAMILIES];

@@ -14,8 +14,11 @@
 
 struct fp_state *g_fp_state;
 
-static pthread_once_t g_once = PTHREAD_ONCE_INIT;
-static bool g_pid_written;
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_refs;
+static bool g_atexit_registered;
+static pid_t g_owner;           /* pid that created the file (a fork must not delete it) */
+static char g_path[4200];
 
 static int mkdir_p(char *path)
 {
@@ -32,57 +35,93 @@ static int mkdir_p(char *path)
     return (mkdir(path, 0755) != 0 && errno != EEXIST) ? -1 : 0;
 }
 
-static void do_open(void)
+static void remove_file(void)
+{
+    if (g_path[0] && getpid() == g_owner)
+        unlink(g_path);
+}
+
+static void on_exit_cleanup(void)
+{
+    /* Games often exit without destroying their device. */
+    remove_file();
+}
+
+static void create_run_file(void)
 {
     const char *home = getenv("HOME");
     if (!home || !home[0]) {
-        fp_log("state file disabled: HOME not set");
+        fp_log("state disabled: HOME not set");
         return;
     }
-    char dir[4096], path[4200];
-    snprintf(dir, sizeof dir, "%s/.local/state/framepace", home);
-    snprintf(path, sizeof path, "%s/state", dir);
+    char dir[4096];
+    snprintf(dir, sizeof dir, "%s/.local/state/framepace/run", home);
+    snprintf(g_path, sizeof g_path, "%s/%d.state", dir, (int)getpid());
     if (mkdir_p(dir) != 0) {
-        fp_log("state file disabled: mkdir %s: %s", dir, strerror(errno));
+        fp_log("state disabled: mkdir %s: %s", dir, strerror(errno));
+        g_path[0] = 0;
         return;
     }
-    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    int fd = open(g_path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd < 0) {
-        fp_log("state file disabled: open %s: %s", path, strerror(errno));
+        fp_log("state disabled: open %s: %s", g_path, strerror(errno));
+        g_path[0] = 0;
         return;
     }
-    struct stat st;
-    if (fstat(fd, &st) != 0 ||
-        ((size_t)st.st_size < sizeof(struct fp_state) &&
-         ftruncate(fd, (off_t)sizeof(struct fp_state)) != 0)) {
-        fp_log("state file disabled: size %s: %s", path, strerror(errno));
+    if (ftruncate(fd, (off_t)sizeof(struct fp_state)) != 0) {
+        fp_log("state disabled: size %s: %s", g_path, strerror(errno));
         close(fd);
+        unlink(g_path);
+        g_path[0] = 0;
         return;
     }
     void *m = mmap(NULL, sizeof(struct fp_state), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) {
-        fp_log("state file disabled: mmap %s: %s", path, strerror(errno));
+        fp_log("state disabled: mmap %s: %s", g_path, strerror(errno));
+        unlink(g_path);
+        g_path[0] = 0;
         return;
     }
     struct fp_state *s = m;
-    if (__atomic_load_n(&s->magic, __ATOMIC_ACQUIRE) != FP_STATE_MAGIC ||
-        __atomic_load_n(&s->version, __ATOMIC_RELAXED) != FP_STATE_VERSION) {
-        memset(s, 0, sizeof *s);
-        s->version = FP_STATE_VERSION;
-        s->cap = 0;
-        s->flags = FP_FLAG_OVERLAY;
-        __atomic_store_n(&s->magic, FP_STATE_MAGIC, __ATOMIC_RELEASE);
-        fp_log("state file initialised");
-    }
+    memset(s, 0, sizeof *s);
+    s->version = FP_STATE_VERSION;
+    s->cap = 0;
+    s->flags = FP_FLAG_OVERLAY;
+    s->pid = (uint32_t)getpid();
+    g_owner = getpid();
+    __atomic_store_n(&s->magic, FP_STATE_MAGIC, __ATOMIC_RELEASE);
     g_fp_state = s;
-    fp_log("state file %s", path);
+    if (!g_atexit_registered) {
+        atexit(on_exit_cleanup);
+        g_atexit_registered = true;
+    }
+    fp_log("state file %s", g_path);
 }
 
-bool fp_state_open(void)
+bool fp_state_acquire(void)
 {
-    pthread_once(&g_once, do_open);
-    return g_fp_state != NULL;
+    pthread_mutex_lock(&g_lock);
+    if (g_refs == 0)
+        create_run_file();
+    bool ok = g_fp_state != NULL;
+    if (ok)
+        g_refs++;
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+void fp_state_release(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (g_refs > 0 && --g_refs == 0 && g_fp_state) {
+        struct fp_state *s = g_fp_state;
+        g_fp_state = NULL;
+        munmap(s, sizeof *s);
+        remove_file();
+        g_path[0] = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
 }
 
 int32_t fp_state_cap(void)
@@ -100,10 +139,6 @@ void fp_state_record(uint64_t present_ns, uint32_t frame_ns, uint32_t work_ns)
     struct fp_state *s = g_fp_state;
     if (!s)
         return;
-    if (!g_pid_written) {
-        __atomic_store_n(&s->pid, (uint32_t)getpid(), __ATOMIC_RELEASE);
-        g_pid_written = true;
-    }
     uint32_t head = __atomic_load_n(&s->head, __ATOMIC_RELAXED);
     uint32_t idx = (head + 1) % FP_RING_SIZE;
     s->ring[idx].present_ns = present_ns;
@@ -111,4 +146,5 @@ void fp_state_record(uint64_t present_ns, uint32_t frame_ns, uint32_t work_ns)
     s->ring[idx].work_ns = work_ns;
     __atomic_store_n(&s->head, idx, __ATOMIC_RELEASE);
     __atomic_store_n(&s->seq, __atomic_load_n(&s->seq, __ATOMIC_RELAXED) + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&s->last_present_ns, present_ns, __ATOMIC_RELEASE);
 }

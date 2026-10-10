@@ -158,8 +158,6 @@ fp_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
     pthread_mutex_unlock(&g_reg_lock);
 
     fp_log("layer loaded (instance %p): %s", (void *)*pInstance, fp_gate_reason());
-    if (fp_gate_active())
-        fp_state_open();
     return VK_SUCCESS;
 }
 
@@ -266,6 +264,7 @@ fp_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *pCreateInfo,
     g_devices = dev;
     pthread_mutex_unlock(&g_reg_lock);
 
+    dev->holds_state = fp_state_acquire();
     fp_log("device created (%p), %u queue families", (void *)*pDevice, dev->nfamilies);
     return VK_SUCCESS;
 }
@@ -287,6 +286,8 @@ static VKAPI_ATTR void VKAPI_CALL fp_DestroyDevice(VkDevice device,
     if (!dev)
         return;
     PFN_vkDestroyDevice next = dev->t.DestroyDevice;
+    if (dev->holds_state)
+        fp_state_release();
     while (dev->swapchains) {   /* normally empty: the app destroys swapchains first */
         fp_swapchain *sc = dev->swapchains;
         dev->swapchains = sc->next;
@@ -316,7 +317,7 @@ fp_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateIn
     const char *why = NULL;
     bool usage_ok = false;
 
-    if (!fp_state_open()) {
+    if (!g_fp_state) {
         why = "no state file";
     } else if (pCreateInfo->imageArrayLayers != 1) {
         why = "multi-layer swapchain";
