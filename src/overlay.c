@@ -26,7 +26,7 @@ struct ov_image {
 
 struct fp_overlay {
     VkExtent2D extent;
-    bool srgb;
+    fp_color_kind color;
     VkRenderPass rp;
     VkPipelineLayout layout;
     VkPipeline pipeline;
@@ -35,12 +35,6 @@ struct fp_overlay {
     struct ov_image *img;
     fp_panel_cache cache;
 };
-
-static bool is_srgb(VkFormat f)
-{
-    return f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB ||
-           f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
-}
 
 static bool pick_memory_type(const fp_device *dev, uint32_t type_bits, uint32_t *out)
 {
@@ -239,7 +233,11 @@ struct fp_overlay *fp_overlay_create(fp_device *dev, const fp_swapchain *sc,
         goto fail;
     ov->nimages = n;
     ov->extent = sc->extent;
-    ov->srgb = is_srgb(sc->format);
+    bool fallback;
+    ov->color = fp_color_kind_for(sc->format, sc->colorspace, &fallback);
+    fp_log("overlay colours: %s (format %d, colorspace %d)%s", fp_color_kind_name(ov->color),
+           (int)sc->format, (int)sc->colorspace,
+           fallback ? ", unhandled colour space treated as sRGB" : "");
     if (t->GetSwapchainImagesKHR(d, sc->handle, &n, images) != VK_SUCCESS)
         goto fail;
 
@@ -299,7 +297,7 @@ bool fp_overlay_record(fp_device *dev, struct fp_overlay *ov, uint32_t idx,
     struct ov_image *im = &ov->img[idx];
 
     uint32_t nverts = fp_panel_build(im->map, FP_MAX_VERTS, ov->extent.width,
-                                     ov->extent.height, ov->srgb, &ov->cache);
+                                     ov->extent.height, ov->color, &ov->cache);
     if (nverts == 0)
         return false;
 

@@ -348,7 +348,8 @@ fp_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateIn
     if (res != VK_SUCCESS)
         return res;
 
-    fp_log("swapchain created: format %d extent %ux%u images>=%u", (int)pCreateInfo->imageFormat,
+    fp_log("swapchain created: format %d colorspace %d extent %ux%u images>=%u",
+           (int)pCreateInfo->imageFormat, (int)pCreateInfo->imageColorSpace,
            pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
            pCreateInfo->minImageCount);
     if (!usage_ok)
@@ -359,6 +360,7 @@ fp_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateIn
         return res;
     sc->handle = *pSwapchain;
     sc->format = pCreateInfo->imageFormat;
+    sc->colorspace = pCreateInfo->imageColorSpace;
     sc->extent = pCreateInfo->imageExtent;
     sc->usage_ok = usage_ok;
     sc->ov_state = usage_ok ? 0 : 2;

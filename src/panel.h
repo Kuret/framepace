@@ -2,6 +2,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "color.h"
+
 /* Overlay vertex: NDC position + straight-alpha colour (matches the pipeline). */
 typedef struct fp_vertex {
     float x, y;
@@ -18,7 +20,7 @@ typedef struct fp_panel_cache {
 } fp_panel_cache;
 
 /* Build the panel geometry for a w x h swapchain image. Returns the number
- * of vertices written (<= max). `srgb` pre-linearises colours for *_SRGB
- * swapchain formats so the result looks the same as on UNORM. */
-uint32_t fp_panel_build(fp_vertex *out, uint32_t max, uint32_t w, uint32_t h, bool srgb,
+ * of vertices written (<= max). Colours are authored as sRGB and encoded for
+ * the swapchain's colour space with `kind` (see color.h). */
+uint32_t fp_panel_build(fp_vertex *out, uint32_t max, uint32_t w, uint32_t h, fp_color_kind kind,
                         fp_panel_cache *cache);

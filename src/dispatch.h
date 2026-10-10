@@ -83,6 +83,7 @@ typedef struct fp_swapchain {
     struct fp_swapchain *next;
     VkSwapchainKHR handle;
     VkFormat format;
+    VkColorSpaceKHR colorspace;
     VkExtent2D extent;
     bool usage_ok;            /* COLOR_ATTACHMENT was added (or already present) */
     int ov_state;             /* 0 = not tried, 1 = ready, 2 = disabled */

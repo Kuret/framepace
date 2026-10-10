@@ -12,7 +12,7 @@ typedef struct builder {
     fp_vertex *v;
     uint32_t n, max;
     float inv_w, inv_h;
-    bool srgb;
+    fp_color_kind kind;
 } builder;
 
 static void quad(builder *b, float x, float y, float w, float h,
@@ -20,11 +20,11 @@ static void quad(builder *b, float x, float y, float w, float h,
 {
     if (b->n + 6 > b->max)
         return;
-    if (b->srgb) {
-        r = powf(r, 2.2f);
-        g = powf(g, 2.2f);
-        bl = powf(bl, 2.2f);
-    }
+    float rgb[3] = { r, g, bl };
+    fp_color_encode(b->kind, rgb);
+    r = rgb[0];
+    g = rgb[1];
+    bl = rgb[2];
     float x0 = x * b->inv_w * 2.0f - 1.0f, x1 = (x + w) * b->inv_w * 2.0f - 1.0f;
     float y0 = y * b->inv_h * 2.0f - 1.0f, y1 = (y + h) * b->inv_h * 2.0f - 1.0f;
     fp_vertex *v = b->v + b->n;
@@ -77,13 +77,13 @@ static bool recent_mean_ns(const struct fp_state *s, double *mean)
     return true;
 }
 
-uint32_t fp_panel_build(fp_vertex *out, uint32_t max, uint32_t w, uint32_t h, bool srgb,
+uint32_t fp_panel_build(fp_vertex *out, uint32_t max, uint32_t w, uint32_t h, fp_color_kind kind,
                         fp_panel_cache *cache)
 {
     const struct fp_state *s = g_fp_state;
     if (!s || w == 0 || h == 0)
         return 0;
-    builder b = { out, 0, max, 1.0f / (float)w, 1.0f / (float)h, srgb };
+    builder b = { out, 0, max, 1.0f / (float)w, 1.0f / (float)h, kind };
 
     uint64_t now = fp_now_ns();
     int32_t cap = __atomic_load_n(&s->cap, __ATOMIC_RELAXED);
