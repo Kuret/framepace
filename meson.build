@@ -67,8 +67,14 @@ subdir('dev')
 
 # Unit tests: `meson test -C build`
 test_color = executable('test_color', 'tests/test_color.c', 'src/color.c',
-  dependencies : [cc.find_library('m')])
+  dependencies : [cc.find_library('m')],
+  build_by_default : false)
 test('color encoding', test_color)
+
+test_game = executable('test_game', 'tests/test_game.c', 'src/game.c', 'src/gate.c', 'src/util.c',
+  c_args : ['-D_GNU_SOURCE'], dependencies : [thread_dep],
+  build_by_default : false)
+test('game key and settings', test_game)
 
 # Manual HDR swapchain harness (needs a Wayland session): `ninja -C build hdr_swapchain`.
 # Not built by default, and skipped when the Wayland development files are missing.
