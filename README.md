@@ -39,8 +39,10 @@ These are the concrete problems framepace was built to fix, found while tuning W
 Warcraft (Proton, vkd3d-proton, NVIDIA, 144 Hz VRR):
 
 - **In-game limiters wake imprecisely under Wine.** The game's own limiter jittered by
-  about 0.8 ms frame to frame at a 60 fps cap. framepace's early limiter (deadline grid,
-  `clock_nanosleep` followed by a short spin) gets about 0.08 ms.
+  about 0.8 ms frame to frame at an 80 fps cap, measured at the display. An "early"
+  limiter in the Vulkan present path (MangoHud's `early` method, which framepace
+  reproduces with a deadline grid, `clock_nanosleep` and a short spin) got that down to
+  about 0.08 ms.
 - **Presenting before the GPU is done makes frames late by a variable amount.** If a
   limiter releases the present at the deadline but the GPU finishes the frame later, the
   frame reaches the display at deadline + GPU time, and that time varies. Measured at the
@@ -48,8 +50,9 @@ Warcraft (Proton, vkd3d-proton, NVIDIA, 144 Hz VRR):
   perfect 16.667 ms. framepace first waits for the GPU (a fence on its own relay
   submission), then presents on the deadline. This matches what MangoHud's `early` method
   achieves (about 0.3 ms between present and flip).
-- **Changing MangoHud's cap at runtime means reloading its config**, which crashed games
-  on NVIDIA (a double free, see MangoHud issue #2078). framepace's cap is one integer in a
+- **Changing MangoHud's cap at runtime means reloading its config**, which crashed the game
+  on NVIDIA after a few dozen reloads (`free(): double free detected` right after a
+  reload; the same class of bug as MangoHud issue #2078, which was fixed only for exit). framepace's cap is one integer in a
   shared memory file, read with a relaxed atomic load each frame. There is no reload.
 - **A fixed cap is a bad compromise.** Set it low and you waste headroom in light
   scenes; set it high and busy scenes (crowds, effects) hitch. The adaptive daemon follows
