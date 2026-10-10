@@ -25,6 +25,7 @@ foreach s : [['overlay.vert', 'fp_vert_spv'], ['overlay.frag', 'fp_frag_spv']]
 endforeach
 
 layer_sources = files(
+  'src/color.c',
   'src/game.c',
   'src/gate.c',
   'src/layer.c',
@@ -63,3 +64,8 @@ configure_file(
 # Development manifest pointing at the build output, for
 # VK_ADD_IMPLICIT_LAYER_PATH=<builddir>/dev before installing.
 subdir('dev')
+
+# Unit tests: `meson test -C build`
+test_color = executable('test_color', 'tests/test_color.c', 'src/color.c',
+  dependencies : [cc.find_library('m')])
+test('color encoding', test_color)
