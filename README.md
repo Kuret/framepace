@@ -8,6 +8,8 @@ framepace is a Vulkan implicit layer for Linux that does three things:
 - **An adaptive cap daemon** (`fps-cap`) that keeps the cap just below what the game can
   sustain, so frames are paced evenly on a variable-refresh (VRR) display.
 
+Each game keeps its own cap, mode and overlay setting, remembered between runs.
+
 ![overlay](docs/overlay-panel.png)
 
 Full window: [docs/overlay.png](docs/overlay.png)
@@ -135,28 +137,69 @@ curl -fsSL https://raw.githubusercontent.com/Kuret/framepace/main/uninstall.sh |
 ```
 
 or `./uninstall.sh`. It removes the layer and manifest (with `sudo`), the user unit, the
-environment file, `fps-cap` and the cached source and build. Your
-`~/.config/framepace/config` is kept unless you pass `--purge`, which also removes the
-state file. Also supports `--dry-run` and `--prefix DIR`. Log out and in again afterwards.
+environment file, `fps-cap`, the live run files and the cached source and build. Your
+`~/.config/framepace` (the config and the saved per-game settings in `games/`) is kept
+unless you pass `--purge`. Also supports `--dry-run` and `--prefix DIR`. Log out and in
+again afterwards.
 
 ## Using it
 
-Start a game normally. The overlay appears at the top left, and the cap is adaptive by
-default once the daemon runs. `fps-cap` controls everything:
+Start a game normally. The overlay appears at the top left, and the cap follows the game's
+saved mode (adaptive by default once the daemon runs). `fps-cap` controls everything:
 
 | Command | Effect |
 |---|---|
-| `fps-cap up [n]` / `down [n]` | Raise/lower the cap by `n` (default 1); switches to manual mode. |
-| `fps-cap set N` | Set the cap; switches to manual mode. |
-| `fps-cap off` | No cap from framepace (overlay only); manual mode. |
+| `fps-cap up [n]` / `down [n]` | Raise/lower the cap by `n` (default 1); manual mode. |
+| `fps-cap set N` | Set the cap; manual mode. |
+| `fps-cap off` | No cap from framepace (overlay only). |
 | `fps-cap adaptive [on\|off\|toggle]` | Let the daemon manage the cap. |
 | `fps-cap overlay [on\|off\|toggle]` | Show or hide the overlay. |
-| `fps-cap status` | Mode, cap, overlay, frame counter, writer pid and limits. |
+| `fps-cap status` | The target game: mode, cap, overlay, frame counter, pid and limits. |
+| `fps-cap list` | Running games (pid, mode, cap, overlay, fps) and the saved settings of other games. |
 | `fps-cap daemon` | The adaptive controller (run by `framepace.service`). |
+| `fps-cap --game KEY ...` | Apply any command above to a named game instead of the target. |
 | `fps-cap --help` | Usage. |
 
-Caps are clamped to `MIN_CAP`..`MAX_CAP`. The overlay line 2 shows `CAP 90 A` in adaptive
-mode, `CAP 90 M` in manual mode, and `CAP OFF` when uncapped.
+Caps are clamped to `MIN_CAP`..`MAX_CAP`. The overlay's second line shows `CAP 90 A` in
+adaptive mode, `CAP 90 M` in manual mode, and `CAP OFF` when uncapped.
+
+### Games and saved settings
+
+Several games can run at once, each with its own live state. A **game key** identifies a game:
+
+- `steam-<id>` when `SteamAppId`, `SteamGameId` or `STEAM_COMPAT_APP_ID` (checked in that
+  order) holds a purely numeric, nonzero id. Non-numeric values are ignored: umu and
+  Faugus put a hash in `STEAM_COMPAT_APP_ID` that is shared by a launcher and its game.
+- otherwise the executable name: for Wine processes the basename of `argv[0]` (a Windows
+  path such as `C:\...\WowB.exe` becomes `WowB.exe`), for native games the basename of
+  `/proc/self/exe`.
+- sanitised to `[A-Za-z0-9._-]`, at most 63 characters (a leading `.` becomes `_`).
+
+Settings are saved per game in `~/.config/framepace/games/<key>.conf`:
+
+```
+mode = adaptive        # adaptive | manual | off
+cap = 72               # the manual cap
+overlay = on           # on | off
+last_adaptive = 93     # where adaptive mode last settled
+```
+
+The layer reads this file when the game starts, so the game begins with the saved cap and
+overlay from its first frame: manual uses `cap`, off means uncapped, adaptive starts at
+`last_adaptive` (or at `MAX_CAP` if you set a fixed one, or uncapped until the daemon sets a
+cap). Games without a file use `DEFAULT_MODE` and `DEFAULT_OVERLAY` from the config. The
+parser ignores unknown keys and bad lines. **`fps-cap` is the only writer** of these files:
+`up`, `down`, `set`, `off`, `adaptive` and `overlay` update the game's live state and its
+`.conf`, and the daemon saves `last_adaptive` (when the game pauses or exits, and at most
+every 15 s while running).
+
+Which game a command or the daemon acts on, unless `--game KEY` is given: with Hyprland,
+the game of the fullscreen active window (matched by pid, including child processes);
+otherwise the running game that presented most recently. If `--game` names a game that is
+not running, only its saved settings change. The daemon adapts only its target; other
+running games keep their caps. It stays on its current target while that game keeps
+presenting, and switches when it stalls (or, on Hyprland, when focus moves to another
+fullscreen game).
 
 ### Hotkeys
 
@@ -192,10 +235,14 @@ Shortcuts. Use `~/.local/bin/fps-cap` as the full path if your desktop does not 
 | `MIN_CAP` | `50` | Lowest cap fps-cap will set. Set it to just above your monitor's VRR floor (frames collide right at the floor). |
 | `MAX_CAP` | `0` | Highest cap. `0` = auto: `refresh - refresh^2/3600` (144 Hz gives 138, 60 Hz gives 59), using the fastest connected output from `hyprctl monitors -j`, else `wlr-randr`, else `xrandr`, else 138. |
 | `MARGIN` | `1.05` | Adaptive cap = `1000 / (tail work time in ms * MARGIN)`. |
+| `DEFAULT_MODE` | `adaptive` | Mode for games without saved settings: `adaptive`, `manual` or `off` (uncapped). |
+| `DEFAULT_OVERLAY` | `on` | Overlay for games without saved settings. |
 | `PAUSE_WHEN_NOT_FULLSCREEN` | `yes` | Hyprland only: pause adapting while the active window is not fullscreen. Ignored when `hyprctl` or the Hyprland environment is unavailable. |
 
 The daemon reads the config at start; restart it after editing
-(`systemctl --user restart framepace.service`). `fps-cap` commands read it every time.
+(`systemctl --user restart framepace.service`). `fps-cap` commands read it every time, and
+the layer reads it when a game starts. The installer only ever adds missing keys to an
+existing config (with a comment), and never rewrites it.
 
 ## How it works
 
@@ -281,65 +328,87 @@ and a host-visible vertex buffer. Text is an embedded 5x7 bitmap font, one quad 
 pixel, scaled to about `height / 480` px per font pixel. The panel shows fps and frame
 time (mean over the last ~0.5 s, refreshed about 4 times a second), the cap with `A`/`M`,
 and a graph of the last 120 frame times (0-33 ms, with a line at the cap interval).
-Overlay visibility is bit 0 of `flags`; when off there is zero extra work. SRGB swapchains
-get a plain 2.2 colour pre-linearisation; there is no HDR handling.
+Overlay visibility is bit 0 of `flags`; when off there is zero extra work.
 
-### The state file
+**Colours.** The panel's colours are authored as sRGB and encoded once per vertex on the
+CPU for the swapchain's colour space (recorded at swapchain creation), so it looks the same
+everywhere. The panel keeps the same translucency, and 1.0 in sRGB maps to a 200 nit paper
+white on HDR outputs (the "soft white" text, sRGB 0.8, is about 120 nits):
 
-`$HOME/.local/state/framepace/state` is the control channel: external tools write `cap`
-and `flags`; the layer writes frame timing. It is created (with its directory) by the
-layer or by `fps-cap`, sized with `ftruncate`, and mapped `MAP_SHARED`. Little-endian,
-packed, version 1, 4128 bytes:
+| Colour space | Encoding |
+|---|---|
+| `SRGB_NONLINEAR` | UNORM formats: as authored. `*_SRGB` formats: linearised, because the hardware encodes. |
+| `HDR10_ST2084_EXT` (PQ, usually A2B10G10R10 / A2R10G10B10) | linearise, 1.0 = 200 nits, BT.709 to BT.2020 primaries, PQ inverse EOTF (200 nits is code value 0.579). |
+| `EXTENDED_SRGB_LINEAR_EXT` (scRGB, usually R16G16B16A16_SFLOAT) | linearise, times 2.5 (1.0 = 80 nits in scRGB). |
+| `BT2020_LINEAR_EXT` | linearise, BT.709 to BT.2020, times 2.5 (1.0 = 80 nits). |
+| `HDR10_HLG_EXT` and any other | treated as sRGB; logged once per swapchain under `FRAMEPACE_DEBUG`. |
+
+Alpha stays linear coverage. Blending happens in the encoded space, which is acceptable for
+a small translucent panel (the edges of the glyphs and the panel's darkening are slightly
+different from a blend in linear light on HDR targets).
+
+### The live state files
+
+Every active game process creates its own file when its first Vulkan device is created:
+`$HOME/.local/state/framepace/run/<pid>.state`. It is deleted when the last device is
+destroyed and at process exit; games often die without cleanup, so `fps-cap` also removes
+files whose pid is gone. External tools write `cap` and `flags`; the layer writes frame
+timing. The file is `ftruncate`d to size and mapped `MAP_SHARED`. Little-endian, layout
+**version 2**, 4200 bytes:
 
 | Offset | Field | Type | Written by | Meaning |
 |---:|---|---|---|---|
 | 0 | `magic` | u32 | layer | `0x43415046` ('F','P','A','C') |
-| 4 | `version` | u32 | layer | `1` |
-| 8 | `cap` | i32 | tools | Fps cap; `0` = unlimited. Read every frame. |
+| 4 | `version` | u32 | layer | `2` |
+| 8 | `cap` | i32 | tools | Fps cap; `0` = unlimited. Read every frame. Initialised from the game's saved settings. |
 | 12 | `flags` | u32 | tools | bit0 overlay visible, bit1 adaptive mode (display), bit2 manual mode (display) |
-| 16 | `seq` | u64 | layer | Total frames presented; stored after the ring entry. |
+| 16 | `seq` | u64 | layer | Total frames presented by this process; stored after the ring entry. |
 | 24 | `head` | u32 | layer | Index of the most recent ring entry. |
-| 28 | `pid` | u32 | layer | Pid of the process writing frames. |
-| 32 + 16*i | `ring[i]`, i < 256 | 16 bytes | layer | `present_ns` u64, `frame_ns` u32, `work_ns` u32 |
+| 28 | `pid` | u32 | layer | Pid of the process. |
+| 32 | `last_present_ns` | u64 | layer | `CLOCK_MONOTONIC` of the latest present. |
+| 40 | `game` | char[64] | layer | Game key, NUL-terminated; written once at creation. |
+| 104 + 16*i | `ring[i]`, i < 256 | 16 bytes | layer | `present_ns` u64, `frame_ns` u32, `work_ns` u32 |
 
 ```c
 struct fp_frame { uint64_t present_ns; uint32_t frame_ns; uint32_t work_ns; };
 struct fp_state {
     uint32_t magic, version; int32_t cap; uint32_t flags;
     uint64_t seq; uint32_t head, pid;
+    uint64_t last_present_ns;
+    char game[64];
     struct fp_frame ring[256];
 };
 ```
 
-- A fresh file is initialised with cap 0 and flags 1 (overlay on).
 - The layer reads `cap` and `flags` with relaxed atomic loads; it writes the ring entry,
-  then `head`, then `seq`, with release stores. Read `seq` with acquire semantics.
+  then `head`, then `seq`, then `last_present_ns`, with release stores. Read `seq` with
+  acquire semantics.
 - `present_ns`: `CLOCK_MONOTONIC` when the frame was handed to the driver.
   `frame_ns`: interval since the previous present (0 for the first frame).
   `work_ns`: previous present returned until the frame was rendered, i.e. CPU plus GPU
   time without the limiter's wait, and the best headroom measure available. When the
   layer did not wait for the GPU (cap 0, or a present that could not be relayed) it is
   previous present returned until this present call.
-- `seq` is not reset when a new process attaches; use `pid` and `present_ns` to detect a
-  restart.
-- There is one state file for the whole user session: the cap applies to whichever game is
-  presenting, and with several games running they share it.
+- The old single `~/.local/state/framepace/state` file (layout v1) is no longer used;
+  `fps-cap`, the daemon and `uninstall.sh` delete it.
 
-`tools/fpstate.py` is a low-level debugging tool for this file (`get`, `set-cap N`,
-`overlay on|off`, `mode adaptive|manual|none`, `frames [N]`, `stress`). Use `fps-cap` for
-normal control.
+`tools/fpstate.py` is a low-level debugging tool for these files (`list`, `get`,
+`set-cap N`, `overlay on|off`, `mode adaptive|manual|none`, `frames [N]`, `stress`, with
+`--pid` or `--file` to pick one). It does not save settings; use `fps-cap` for normal control.
 
 ### The adaptive controller
 
-`fps-cap daemon` follows whichever process is writing frames, with no dependency on any
+`fps-cap daemon` follows one game at a time (the target described in
+[Games and saved settings](#games-and-saved-settings)), with no dependency on any
 compositor. Every 0.25 s it reads the new ring entries and decides:
 
-- **Following.** It adapts while `seq` advances and the writer `pid` is alive. It
-  pauses when no new frame arrived for 1 s, or the pid is gone, and resets its windows
-  when the pid changes. A frame gap over 250 ms (alt-tab, minimised, loading) is a break:
-  the gap is not counted and the measurement window restarts. Optionally, on Hyprland
-  (`PAUSE_WHEN_NOT_FULLSCREEN`), it also pauses while the active window is not
-  fullscreen.
+- **Following.** It adapts the target while its `seq` advances and its process is alive
+  (run files of dead pids are removed). It pauses when no new frame arrived for 1 s, and
+  resets its windows when the target changes. A frame gap over 250 ms (alt-tab,
+  minimised, loading) is a break: the gap is not counted and the measurement window
+  restarts. Optionally, on Hyprland (`PAUSE_WHEN_NOT_FULLSCREEN`), it also pauses while
+  the active window is not fullscreen. Games in manual or off mode are left alone, as are
+  all games that are not the target.
 - **Target cap.** From the last 30 s of frames, the 99th percentile of `work_ns`
   (window and percentile exist because crowds burst every 20-30 s) and, from the last 2 s,
   the 95th percentile (so walking into a crowd lowers the cap within a second or two).
@@ -371,8 +440,9 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   terminal for Lutris/Heroic). Lines starting `framepace:` say whether the layer loaded,
   why it is active or inactive, the state file path, each swapchain and whether the
   overlay was enabled.
-- **`fps-cap status` shows frames 0 or a stale pid.** The game is not running through the
-  layer: check `FRAMEPACE=1` reached it (log out and in after installing) and that the
+- **`fps-cap list` shows no game, or `fps-cap status` says none is running.** The game
+  is not running through the layer (it has no run file in
+  `~/.local/state/framepace/run/`): check `FRAMEPACE=1` reached it (log out and in after installing) and that the
   process counts as a game (see [Activation](#activation); native games need
   `FRAMEPACE_FORCE=1`).
 - **No overlay but the cap works.** The overlay needs the surface to support
@@ -400,7 +470,8 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
 - **Vulkan only.** OpenGL games are not covered (a game going through DXVK or
   vkd3d-proton is Vulkan, so it is).
 - **Multi-swapchain presents pass through untouched**, without relay, limiter or overlay.
-- **One shared state file** for the whole user session, so one cap for all running games.
+- **The daemon adapts one game at a time** (the focused fullscreen one on Hyprland,
+  otherwise the most recent presenter); other running games keep the cap they have.
 - **The present thread blocks on the GPU** while limiting. This removes CPU run-ahead
   (intended) and costs some throughput near the limit.
 - **Overlay setup happens on the first present** of each swapchain (the present queue is
@@ -408,7 +479,25 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
 - **Tested on NVIDIA** (RTX 5080, driver 615, Hyprland/Wayland, vkcube, and World of
   Warcraft through vkd3d-proton). AMD and Intel are untested; the layer uses only core
   Vulkan, so it may work, but there are no guarantees.
-- 64-bit only. No HDR-specific handling.
+- **HDR is tested only as far as swapchains go:** the encoding math has unit tests and
+  PQ, scRGB and BT.2020 swapchains on NVIDIA/Wayland set up and present with no validation
+  errors, but the output was not checked on a real HDR display.
+- 64-bit only. HDR overlay colours are handled for the four colour spaces listed under
+  [The overlay](#the-overlay); blending happens in the encoded space.
+
+## Development
+
+```sh
+meson setup build && ninja -C build
+meson test -C build        # colour encoding and game key / settings parser
+ninja -C build hdr_swapchain   # optional Wayland harness: presents SDR/HDR swapchains
+VK_ADD_IMPLICIT_LAYER_PATH=$PWD/build/dev FRAMEPACE=1 FRAMEPACE_FORCE=1 FRAMEPACE_DEBUG=1 \
+    build/hdr_swapchain hdr10|scrgb|bt2020|srgb
+```
+
+When testing, run with a scratch `HOME` so your real run files and saved settings are not
+touched (both the layer and `fps-cap` use `$HOME/.local/state/framepace` and
+`$HOME/.config/framepace`).
 
 ## Credits
 
