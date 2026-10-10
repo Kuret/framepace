@@ -8,6 +8,7 @@
 
 #include "dispatch.h"
 #include "limiter.h"
+#include "overlay.h"
 #include "state.h"
 #include "util.h"
 
@@ -107,6 +108,8 @@ static VKAPI_ATTR void VKAPI_CALL fp_GetDeviceQueue2(VkDevice device,
     if (pQueue && pInfo)
         track_queue(dev, *pQueue, pInfo->queueFamilyIndex);
 }
+
+static void release_swapchain(fp_device *dev, fp_swapchain *sc);
 
 /* ---- instance ------------------------------------------------------------ */
 
@@ -270,9 +273,112 @@ static VKAPI_ATTR void VKAPI_CALL fp_DestroyDevice(VkDevice device,
     if (!dev)
         return;
     PFN_vkDestroyDevice next = dev->t.DestroyDevice;
+    while (dev->swapchains) {   /* normally empty: the app destroys swapchains first */
+        fp_swapchain *sc = dev->swapchains;
+        dev->swapchains = sc->next;
+        release_swapchain(dev, sc);
+    }
     pthread_mutex_destroy(&dev->lock);
     free(dev);
     next(device, pAllocator);
+}
+
+/* ---- swapchain ----------------------------------------------------------- */
+
+static fp_swapchain *find_swapchain(fp_device *dev, VkSwapchainKHR h)
+{
+    fp_swapchain *s = dev->swapchains;
+    while (s && s->handle != h)
+        s = s->next;
+    return s;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+fp_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo,
+                      const VkAllocationCallbacks *pAllocator, VkSwapchainKHR *pSwapchain)
+{
+    fp_device *dev = device_from_key(get_key(device));
+    VkSwapchainCreateInfoKHR ci = *pCreateInfo;
+    const char *why = NULL;
+    bool usage_ok = false;
+
+    if (!fp_state_open()) {
+        why = "no state file";
+    } else if (pCreateInfo->imageArrayLayers != 1) {
+        why = "multi-layer swapchain";
+    } else if (pCreateInfo->imageUsage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) {
+        usage_ok = true;
+    } else if (!dev->inst->t.GetPhysicalDeviceSurfaceCapabilitiesKHR) {
+        why = "surface capabilities unavailable";
+    } else {
+        VkSurfaceCapabilitiesKHR caps;
+        if (dev->inst->t.GetPhysicalDeviceSurfaceCapabilitiesKHR(dev->phys, pCreateInfo->surface,
+                                                                 &caps) != VK_SUCCESS)
+            why = "surface capabilities query failed";
+        else if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
+            why = "surface does not support COLOR_ATTACHMENT usage";
+        else {
+            ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+            usage_ok = true;
+        }
+    }
+
+    VkResult res = dev->t.CreateSwapchainKHR(device, &ci, pAllocator, pSwapchain);
+    if (res != VK_SUCCESS && usage_ok && ci.imageUsage != pCreateInfo->imageUsage) {
+        /* Driver refused the extra usage: fall back to what the app asked for. */
+        usage_ok = false;
+        why = "driver rejected COLOR_ATTACHMENT usage";
+        res = dev->t.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+    }
+    if (res != VK_SUCCESS)
+        return res;
+
+    fp_log("swapchain created: format %d extent %ux%u images>=%u", (int)pCreateInfo->imageFormat,
+           pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
+           pCreateInfo->minImageCount);
+    if (!usage_ok)
+        fp_log("overlay disabled for swapchain: %s", why ? why : "unknown");
+
+    fp_swapchain *sc = calloc(1, sizeof *sc);
+    if (!sc)
+        return res;
+    sc->handle = *pSwapchain;
+    sc->format = pCreateInfo->imageFormat;
+    sc->extent = pCreateInfo->imageExtent;
+    sc->usage_ok = usage_ok;
+    sc->ov_state = usage_ok ? 0 : 2;
+    pthread_mutex_lock(&dev->lock);
+    sc->next = dev->swapchains;
+    dev->swapchains = sc;
+    pthread_mutex_unlock(&dev->lock);
+    return res;
+}
+
+static void release_swapchain(fp_device *dev, fp_swapchain *sc)
+{
+    if (sc->ov)
+        fp_overlay_destroy(dev, sc->ov);
+    free(sc);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+fp_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                       const VkAllocationCallbacks *pAllocator)
+{
+    fp_device *dev = device_from_key(get_key(device));
+    fp_swapchain *sc = NULL;
+    pthread_mutex_lock(&dev->lock);
+    for (fp_swapchain **p = &dev->swapchains; *p; p = &(*p)->next) {
+        if ((*p)->handle == swapchain) {
+            sc = *p;
+            *p = sc->next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dev->lock);
+    if (sc)
+        release_swapchain(dev, sc);
+    dev->t.DestroySwapchainKHR(device, swapchain, pAllocator);
 }
 
 /* ---- present ------------------------------------------------------------- */
@@ -293,6 +399,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL fp_QueuePresentKHR(VkQueue queue,
         return dev->t.QueuePresentKHR(queue, pPresentInfo);   /* pure passthrough */
 
     VkPresentInfoKHR present = *pPresentInfo;
+    VkSemaphore overlay_sem = VK_NULL_HANDLE;
+
+    /* Overlay: draw into the image being presented. Only for the common
+     * single-swapchain present (binary wait semaphores can be waited once). */
+    if ((fp_state_flags() & FP_FLAG_OVERLAY) && pPresentInfo->swapchainCount == 1 &&
+        family < dev->nfamilies && (dev->family_flags[family] & VK_QUEUE_GRAPHICS_BIT)) {
+        pthread_mutex_lock(&dev->lock);
+        fp_swapchain *sc = find_swapchain(dev, pPresentInfo->pSwapchains[0]);
+        int state = sc ? sc->ov_state : 2;
+        pthread_mutex_unlock(&dev->lock);
+        if (sc && state != 2) {
+            if (state == 0) {
+                struct fp_overlay *ov = fp_overlay_create(dev, sc, family);
+                pthread_mutex_lock(&dev->lock);
+                sc->ov = ov;
+                sc->ov_state = ov ? 1 : 2;
+                pthread_mutex_unlock(&dev->lock);
+                fp_log(ov ? "overlay enabled for swapchain %ux%u"
+                          : "overlay disabled for swapchain %ux%u: resource creation failed",
+                       sc->extent.width, sc->extent.height);
+            }
+            if (sc->ov) {
+                bool broken = false;
+                if (fp_overlay_draw(dev, sc->ov, queue, pPresentInfo->pImageIndices[0],
+                                    pPresentInfo->waitSemaphoreCount,
+                                    pPresentInfo->pWaitSemaphores, &overlay_sem, &broken)) {
+                    present.waitSemaphoreCount = 1;
+                    present.pWaitSemaphores = &overlay_sem;
+                } else if (broken) {
+                    sc->ov_state = 2;   /* keep the resources, stop drawing */
+                    fp_log("overlay disabled for swapchain: submission failed");
+                }
+            }
+        }
+    }
 
     /* Limiter: after the overlay has been submitted, before handing down. */
     uint64_t present_ns = fp_limiter_wait(fp_state_cap());
@@ -324,6 +465,8 @@ static PFN_vkVoidFunction device_hook(const char *name)
     HOOK_DEVICE(DestroyDevice);
     HOOK_DEVICE(GetDeviceQueue);
     HOOK_DEVICE(GetDeviceQueue2);
+    HOOK_DEVICE(CreateSwapchainKHR);
+    HOOK_DEVICE(DestroySwapchainKHR);
     HOOK_DEVICE(QueuePresentKHR);
     return NULL;
 }
