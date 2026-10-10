@@ -93,7 +93,10 @@ The installer (POSIX sh, safe to run repeatedly):
    `/usr/lib/framepace/libVkLayer_framepace.so` and the manifest to
    `/usr/share/vulkan/implicit_layer.d/framepace.x86_64.json`.
 4. Installs `fps-cap` into `~/.local/bin` (it warns if that is not on your `PATH`).
-5. Writes `~/.config/environment.d/90-framepace.conf` containing `FRAMEPACE=1`.
+5. Writes `~/.config/environment.d/90-framepace.conf` containing `FRAMEPACE=1`, unless
+   `FRAMEPACE=1` is already set in another `environment.d` file (for example a
+   system-wide `/etc/environment.d/*.conf` where you keep your gaming variables), which it
+   then leaves as the single place it's set.
 6. Installs and starts the `framepace.service` systemd user unit (`fps-cap daemon`).
 7. Writes `~/.config/framepace/config` if it does not exist yet.
 
@@ -243,6 +246,22 @@ The daemon reads the config at start; restart it after editing
 (`systemctl --user restart framepace.service`). `fps-cap` commands read it every time, and
 the layer reads it when a game starts. The installer only ever adds missing keys to an
 existing config (with a comment), and never rewrites it.
+
+### Other limiters and overlays
+
+framepace is meant to be the only frame cap and fps overlay. Other caps don't break it,
+but each one is another limiter in the chain, usually a less precise one, and a cap below
+framepace's silently overrides the adaptive cap. Remove the duplicates:
+
+| Setting | What it is | With framepace |
+|---|---|---|
+| `DXVK_HUD` | DXVK's own overlay (fps, frame times, latency) | Duplicate overlay; remove it globally, enable it per game only when you need DXVK's latency details. |
+| `dxgi.maxFrameRate` in `DXVK_CONFIG`, `DXVK_FRAME_RATE`, `VKD3D_FRAME_RATE` | DXVK's and vkd3d-proton's frame caps (vkd3d-proton applies the `dxgi` cap to D3D12 games too) | Duplicate cap; remove it. framepace's `MAX_CAP` (auto: refresh − refresh²/3600) is the ceiling. vkd3d-proton's cap in particular paces coarsely: 10.9–26 ms intervals at a 60 cap in the test that led to framepace. |
+| MangoHud (`MANGOHUD=1`, `fps_limit`) | Overlay and cap | Duplicate of both; don't enable it for games that framepace handles. |
+| The game's own fps cap | In-game "max fps" | Set it to unlimited or above framepace's cap; under Wine it wakes imprecisely. |
+| In-game "low latency" / NVIDIA Reflex modes | Frame-start pacing by the game | Test per game. In World of Warcraft, "None" paced best with an external limiter, "Built-in" was much worse. |
+| `dxvk.framePace=low-latency…`, `PROTON_DXVK_LOWLATENCY=1` | DXVK's frame-start pacing for D3D9–11 games: it starts each frame just in time, which lowers input latency | Not a duplicate. framepace paces the end of the frame (presentation); DXVK's low-latency mode times the start. They can be combined; this combination is not measured yet. It does nothing for D3D12 (vkd3d-proton) games. |
+| `gamescope -r` | gamescope's limiter | framepace stays inactive inside gamescope; use gamescope's. |
 
 ## How it works
 
