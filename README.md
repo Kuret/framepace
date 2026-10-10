@@ -414,6 +414,6 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
 - [DXVK](https://github.com/doitsujin/dxvk) and
   [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton): the translation
   layers this was tuned against.
-- The 5x7 glyphs are the classic public-domain column font.
+- The 5x7 glyph table is the common 5x7 column font.
 
 License: [MIT](LICENSE), copyright 2026 Rick Littel.
