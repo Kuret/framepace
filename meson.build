@@ -25,6 +25,7 @@ foreach s : [['overlay.vert', 'fp_vert_spv'], ['overlay.frag', 'fp_frag_spv']]
 endforeach
 
 layer_sources = files(
+  'src/gate.c',
   'src/layer.c',
   'src/limiter.c',
   'src/overlay.c',

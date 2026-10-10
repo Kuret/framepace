@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "dispatch.h"
+#include "gate.h"
 #include "limiter.h"
 #include "overlay.h"
 #include "state.h"
@@ -144,17 +145,21 @@ fp_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
     inst->handle = *pInstance;
     inst->key = get_key(*pInstance);
     inst->t.GetInstanceProcAddr = next_gipa;
+    inst->t.DestroyInstance = (PFN_vkDestroyInstance)next_gipa(*pInstance, "vkDestroyInstance");
+    if (fp_gate_active()) {
 #define X(n) inst->t.n = (PFN_vk##n)next_gipa(*pInstance, "vk" #n);
-    FP_INSTANCE_FUNCS(X)
+        FP_INSTANCE_FUNCS(X)
 #undef X
+    }
 
     pthread_mutex_lock(&g_reg_lock);
     inst->next = g_instances;
     g_instances = inst;
     pthread_mutex_unlock(&g_reg_lock);
 
-    fp_state_open();
-    fp_log("layer loaded (instance %p)", (void *)*pInstance);
+    fp_log("layer loaded (instance %p): %s", (void *)*pInstance, fp_gate_reason());
+    if (fp_gate_active())
+        fp_state_open();
     return VK_SUCCESS;
 }
 
@@ -230,6 +235,15 @@ fp_CreateDevice(VkPhysicalDevice phys, const VkDeviceCreateInfo *pCreateInfo,
     dev->set_loader_data = set_data;
     pthread_mutex_init(&dev->lock, NULL);
     dev->t.GetDeviceProcAddr = next_gdpa;
+    if (!fp_gate_active()) {
+        /* Inactive process: remember only what is needed to pass calls through. */
+        dev->t.DestroyDevice = (PFN_vkDestroyDevice)next_gdpa(*pDevice, "vkDestroyDevice");
+        pthread_mutex_lock(&g_reg_lock);
+        dev->next = g_devices;
+        g_devices = dev;
+        pthread_mutex_unlock(&g_reg_lock);
+        return VK_SUCCESS;
+    }
 #define X(n) dev->t.n = (PFN_vk##n)next_gdpa(*pDevice, "vk" #n);
     FP_DEVICE_FUNCS(X)
 #undef X
@@ -518,6 +532,12 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fp_GetDeviceProcAddr(VkDevice de
     fp_device *dev = device_from_key(get_key(device));
     if (!dev)
         return NULL;
+    if (!fp_gate_active()) {
+        /* Inactive: only DestroyDevice (to free our bookkeeping) is ours. */
+        if (!strcmp(name, "vkDestroyDevice"))
+            return (PFN_vkVoidFunction)fp_DestroyDevice;
+        return dev->t.GetDeviceProcAddr(device, name);
+    }
     PFN_vkVoidFunction hook = device_hook(name);
     if (hook) {
         /* Only hand out a hook when the next layer/driver implements it. */
@@ -542,7 +562,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fp_GetInstanceProcAddr(VkInstanc
     HOOK_INSTANCE(DestroyInstance);
     HOOK_INSTANCE(CreateDevice);
     HOOK_INSTANCE(GetDeviceProcAddr);
-    PFN_vkVoidFunction hook = device_hook(name);
+    PFN_vkVoidFunction hook = fp_gate_active() ? device_hook(name) : NULL;
     if (hook) {
         PFN_vkVoidFunction next = inst->t.GetInstanceProcAddr(instance, name);
         return next ? hook : NULL;
