@@ -30,9 +30,14 @@ Adaptive mode follows the target game. The layer reports, per frame, how long it
 release to finished rendering (CPU and GPU together). The cap follows the slow tail of those
 times, so it sits where nearly every frame fits: the 99th percentile of the last 30 s and the 95th
 of the last 2 s (whichever needs the lower cap), plus a 5% margin. Busy scenes such as crowds show
-up as a heavier tail and lower the cap at once; it rises by 1 every half second once the target has
-stayed above it for 5 s. Single frames over 100 ms (loading) are left out of the tail. As a backup,
-more than 5% modestly late frames in a second drops the cap to just under what the game achieved.
+up as a heavier tail and lower the cap at once. An uncapped adaptive game starts at MAX_CAP. A
+target 10+ fps above the cap is climbed to after a 2 s hold at +1 per 0.1 s, a closer one after a
+5 s hold at +1 per 0.5 s. Single frames over 100 ms (loading) are left out of the tail, and so
+is any stretch where the median present interval over the last second exceeds twice the cap's
+interval (loading screens, menus with stalls): nothing is decided then. As a backup, more than 5%
+modestly late frames in a second drops the cap to just under what the game achieved. last_adaptive
+is the time-weighted 75th percentile of the cap over the last 5 minutes of representative play,
+not the value at exit.
 The daemon pauses when no new frame arrived for 1 s or (Hyprland only, optional) the active window
 is not fullscreen; a frame gap over 250 ms (alt-tab, loading) is a break and restarts the
 measurement window. Other running games keep their caps. Dead run files are removed.

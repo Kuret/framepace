@@ -189,8 +189,8 @@ last_adaptive = 93     # where adaptive mode last settled
 
 The layer reads this file when the game starts, so the game begins with the saved cap and
 overlay from its first frame: manual uses `cap`, off means uncapped, adaptive starts at
-`last_adaptive` (or at `MAX_CAP` if you set a fixed one, or uncapped until the daemon sets a
-cap). Games without a file use `DEFAULT_MODE` and `DEFAULT_OVERLAY` from the config. The
+`last_adaptive` (or at `MAX_CAP` if you set a fixed one, or uncapped for a moment until the
+daemon raises it to the resolved `MAX_CAP`). Games without a file use `DEFAULT_MODE` and `DEFAULT_OVERLAY` from the config. The
 parser ignores unknown keys and bad lines. **`fps-cap` is the only writer** of these files:
 `up`, `down`, `set`, `off`, `adaptive` and `overlay` update the game's live state and its
 `.conf`, and the daemon saves `last_adaptive` (when the game pauses or exits, and at most
@@ -438,29 +438,58 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   restarts. Optionally, on Hyprland (`PAUSE_WHEN_NOT_FULLSCREEN`), it also pauses while
   the active window is not fullscreen. Games in manual or off mode are left alone, as are
   all games that are not the target.
-- **Target cap.** From the last 30 s of frames, the 99th percentile of `work_ns`
-  (window and percentile exist because crowds burst every 20-30 s) and, from the last 2 s,
-  the 95th percentile (so walking into a crowd lowers the cap within a second or two).
-  The worse of the two sets `target = 1000 / (worst_ms * MARGIN)`, clamped to
+- **Starting high.** A game in adaptive mode with no cap (a first launch without a saved
+  value, or a `MAX_CAP` that is still automatic, which the layer cannot resolve because it
+  cannot query the monitor) gets the resolved `MAX_CAP` at once and the daemon logs it. It
+  does not adopt a measured target: while a game loads, or sits on a login screen, the
+  frames are slow and would drag the cap to the minimum. Lowering is immediate anyway;
+  raising is the slow path.
+- **Ignoring unrepresentative stretches.** Loading, login, zoning and menus with stalls do
+  not say how heavy the game is. If the median present interval over the last second is
+  more than **2x the interval of the current cap** (the game delivers under half the cap),
+  the stretch is unrepresentative: the daemon decides nothing, and the frames of the
+  stretch stay out of both tail windows (frames are tagged by time, and also the last
+  second before detection and the last second before it ends). Detection lags by up to a
+  second, so a drop made while the stretch was starting is undone and the cap is back where
+  it was. Entering and leaving are logged once each. A game that always runs at under half
+  of its cap stays in this state; it is then effectively uncapped, which is harmless at
+  those frame rates.
+- **Target cap.** From the last 30 s of representative frames, the 99th percentile of
+  `work_ns` (window and percentile exist because crowds burst every 20-30 s) and, from the
+  last 2 s, the 95th percentile (so walking into a crowd lowers the cap within a second or
+  two). The worse of the two sets `target = 1000 / (worst_ms * MARGIN)`, clamped to
   `MIN_CAP`..`MAX_CAP`. Frames with `work_ns` over 100 ms (loading) are excluded from the
   tails. At least 60 frames in the window are needed.
-- **Moving the cap.** It lowers immediately to the target. It raises only after the
-  target has stayed above the cap for 5 s, then by +1 every 0.5 s. When starting from an
-  uncapped game it adopts the target at once.
+- **Moving the cap.** It lowers immediately to the target. Raising has two speeds. If the
+  target is **10 fps or more** above the cap, it waits until the target has stayed above
+  the cap for **2 s**, then climbs by +1 every **0.1 s** (50 to 120 takes about 9 s). Closer
+  than that, the hold is **5 s** and the step is +1 per **0.5 s**. Any drop condition resets
+  the hold. A climb is logged as one line when it starts (`climbing 50 -> 121`) and one when
+  it ends; drops are logged one line each.
 - **Late-frame backup.** If more than 5% of the presents in the last second were modestly
   late (between 1.10 x interval + 1 ms and 1.6 x interval) the cap drops to 96% of the fps
   actually achieved.
+- **What `last_adaptive` means.** It is not the cap at exit. The daemon tracks the cap
+  over the last 5 minutes of representative, active play (paused and unrepresentative
+  time is left out) and saves its time-weighted **75th percentile**, so a game that ends in
+  a loading screen or a heavy zone starts the next time near its usual cap. With less than
+  30 s of such play the saved value is left alone. It is saved when the daemon pauses, when
+  the game exits or the target changes, and at most every 15 s while running.
 
 | Parameter | Value | Config key |
 |---|---|---|
 | Lowest / highest cap | 50 / auto (refresh - refresh^2/3600) | `MIN_CAP`, `MAX_CAP` |
 | Margin | 1.05 | `MARGIN` |
+| Start of an uncapped adaptive game | the resolved `MAX_CAP` | fixed |
+| Unrepresentative stretch | median interval over 1 s > 2 x the cap interval | fixed |
 | Long tail | p99 over 30 s | fixed |
 | Short tail | p95 over 2 s | fixed |
-| Rise hold / step | 5 s / +1 per 0.5 s | fixed |
+| Rise, target 10+ fps above the cap | hold 2 s, +1 per 0.1 s | fixed |
+| Rise, closer | hold 5 s, +1 per 0.5 s | fixed |
 | Loading exclusion | 100 ms | fixed |
 | Break gap / stall | 250 ms / 1 s | fixed |
 | Late-frame backup | >5% late, cap to 96% of achieved | fixed |
+| `last_adaptive` | p75 of the cap over 5 min of representative play, needs 30 s | fixed |
 
 ## Troubleshooting
 
