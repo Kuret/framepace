@@ -459,9 +459,12 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   So after every **transition** (following a new game, resuming after a pause because
   frames stopped or the window left fullscreen, the end of an unrepresentative stretch, or a
   frame gap over 250 ms) the daemon settles for **10 s** (restarting if another transition
-  happens inside it). While settling, frames are never added to the tail windows, nothing
-  climbs, and the cap may fall only through the late-frame backup (frames really arriving
-  late under the current cap). The daemon logs `settling for 10 s (reason)` and `settled`.
+  happens inside it). While settling, frames are never added to the tail windows and the
+  cap neither climbs nor drops, not even through the late-frame backup: in World of Warcraft
+  the login screen and the first seconds of streaming in a world deliver late frames that
+  say nothing about gameplay, and the backup dragged the cap from 77 to 50 there. A cap that
+  is briefly too high only lets the game pace itself for at most 10 s. The daemon logs
+  `settling for 10 s (reason)` and `settled`.
   Afterwards decisions use only post-settle frames, at least 60 of them, and climbing keeps
   its holds.
 - **Target cap.** From the last 30 s of representative frames, the 99th percentile of

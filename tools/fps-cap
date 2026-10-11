@@ -36,7 +36,7 @@ target 10+ fps above the cap is climbed to after a 2 s hold at +1 per 0.1 s, a c
 is any stretch where the median present interval over the last second exceeds twice the cap's
 interval and 25 ms (loading screens, menus with stalls): nothing is decided then. After every
 transition (new game, resume after a pause, end of such a stretch, a frame gap) it settles for 10 s:
-frames are not measured, nothing climbs, and only the late-frame backup may lower the cap. As a backup, more than 5%
+frames are not measured and the cap neither climbs nor drops. Outside settling, as a backup, more than 5%
 modestly late frames in a second drops the cap to just under what the game achieved. last_adaptive
 is the time-weighted 75th percentile of the cap over the last 5 minutes of representative play,
 not the value at exit.
@@ -699,16 +699,12 @@ def daemon():
             return late, None
 
         if tr.settling:
-            # Settling after a transition: nothing is measured and nothing climbs. The cap may drop
-            # only through the late-frame backup, i.e. frames really arriving late under it.
+            # Settling after a transition: nothing is measured, nothing climbs and nothing drops.
+            # Even the late-frame backup stays off: in WoW, login screens and the first seconds of
+            # streaming in a world deliver late frames that say nothing about gameplay, and dragged
+            # the cap from 77 to 50. A cap that is briefly too high only lets the game set its own
+            # pace for at most SETTLE_S.
             tr.end_climb(cap, "stopped (settling)")
-            late, backup = late_backup(tr.frames)
-            if backup is not None and backup < cap:
-                new_cap = st.set_cap(backup)
-                if new_cap != cap:
-                    log(f"{cap} -> {new_cap}: {late:.0%} late (while settling)")
-                    tr.cap_changes.append((now_ns, cap, new_cap))
-                    changed_ns = now_ns
             continue
 
         frames = tr.representative()
