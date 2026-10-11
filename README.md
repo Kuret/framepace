@@ -446,14 +446,15 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   raising is the slow path.
 - **Ignoring unrepresentative stretches.** Loading, login, zoning and menus with stalls do
   not say how heavy the game is. If the median present interval over the last second is
-  more than **2x the interval of the current cap** (the game delivers under half the cap),
-  the stretch is unrepresentative: the daemon decides nothing, and the frames of the
+  more than **2x the interval of the current cap** (the game delivers under half the cap)
+  **and over 25 ms** (under 40 fps), the stretch is unrepresentative: the daemon decides nothing, and the frames of the
   stretch stay out of both tail windows (frames are tagged by time, and also the last
   second before detection and the last second before it ends). Detection lags by up to a
   second, so a drop made while the stretch was starting is undone and the cap is back where
-  it was. Entering and leaving are logged once each. A game that always runs at under half
-  of its cap stays in this state; it is then effectively uncapped, which is harmless at
-  those frame rates.
+  it was. Entering and leaving are logged once each. The 25 ms floor keeps a heavy game
+  that simply plays at 45-60 fps out of this state, so it still gets an even cap; only a
+  game that sits below 40 fps the whole time stays uncapped, and that is under the 48 Hz
+  floor of most VRR panels anyway.
 - **Target cap.** From the last 30 s of representative frames, the 99th percentile of
   `work_ns` (window and percentile exist because crowds burst every 20-30 s) and, from the
   last 2 s, the 95th percentile (so walking into a crowd lowers the cap within a second or
@@ -481,7 +482,7 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
 | Lowest / highest cap | 50 / auto (refresh - refresh^2/3600) | `MIN_CAP`, `MAX_CAP` |
 | Margin | 1.05 | `MARGIN` |
 | Start of an uncapped adaptive game | the resolved `MAX_CAP` | fixed |
-| Unrepresentative stretch | median interval over 1 s > 2 x the cap interval | fixed |
+| Unrepresentative stretch | median interval over 1 s > 2 x the cap interval and > 25 ms | fixed |
 | Long tail | p99 over 30 s | fixed |
 | Short tail | p95 over 2 s | fixed |
 | Rise, target 10+ fps above the cap | hold 2 s, +1 per 0.1 s | fixed |

@@ -98,7 +98,10 @@ CLIMB_FAR_GAP = 10              # target this far above the cap (fps): climb fas
 RISE_HOLD_FAR, RISE_STEP_FAR = 2.0, 0.1   # ... after a shorter hold, +1 per 0.1 s
 UNREP_FACTOR = 2.0              # a stretch is unrepresentative (loading, login, zoning, menus with stalls)
                                 # when the median present interval over the last second is more than this
-                                # many times the cap's interval, i.e. the game delivers under half the cap
+                                # many times the cap's interval, i.e. the game delivers under half the cap,
+UNREP_MIN_MS = 25.0             # ... and is also slower than this (under 40 fps). Loading screens and stalls
+                                # are far slower; a heavy game playing at 45-60 fps must still get capped,
+                                # instead of staying in this state at a high starting cap
 REP_WINDOW_S = 300.0            # last_adaptive: look at the cap over this much recent play ...
 REP_QUANTILE = 0.75             # ... and save this (time-weighted) percentile of it, not the value at exit
 REP_MIN_S = 30.0                # with less representative play than this, the saved value is left alone
@@ -640,7 +643,7 @@ def daemon():
         last_second = sorted(f[1] for f in tr.frames if f[0] > now_ns - 1e9 and f[1] > 0)
         if last_second:
             median_ms = last_second[len(last_second) // 2] / 1e6
-            unrep = median_ms > UNREP_FACTOR * 1000 / cap
+            unrep = median_ms > UNREP_FACTOR * 1000 / cap and median_ms > UNREP_MIN_MS
             if unrep and not tr.in_stretch:
                 start = now_ns - 1e9               # the window that revealed it
                 tr.stretches.append([start, None])
@@ -653,7 +656,7 @@ def daemon():
                     changed_ns = now_ns
                     log(f"restored cap {cap}: drop made while the stretch was starting")
                 log(f"unrepresentative stretch: median present interval {median_ms:.1f} ms is over "
-                    f"{UNREP_FACTOR:g}x the {1000 / cap:.1f} ms cap interval; deciding nothing")
+                    f"{UNREP_FACTOR:g}x the {1000 / cap:.1f} ms cap interval and over {UNREP_MIN_MS:g} ms; deciding nothing")
             elif not unrep and tr.in_stretch:
                 # the last second still holds the tail of the stretch, which is why it only just looked
                 # representative: leave it out too
