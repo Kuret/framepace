@@ -89,6 +89,14 @@ TAIL_LONG, TAIL_LONG_Q = 30.0, 0.99   # window (s) and percentile of frame work 
 TAIL_SHORT, TAIL_SHORT_Q = 2.0, 0.95  # a short window, so walking into a crowd lowers the cap within ~1-2 s
 LOADING_MS = 100                # frames slower than this are loading hitches, not the scene's load
 RISE_HOLD, RISE_STEP = 5.0, 0.5 # target must stay above the cap this long; then +1 per RISE_STEP s
+CLIMB_FAR_GAP = 10              # target this far above the cap (fps): climb fast ...
+RISE_HOLD_FAR, RISE_STEP_FAR = 2.0, 0.1   # ... after a shorter hold, +1 per 0.1 s
+UNREP_FACTOR = 2.0              # a stretch is unrepresentative (loading, login, zoning, menus with stalls)
+                                # when the median present interval over the last second is more than this
+                                # many times the cap's interval, i.e. the game delivers under half the cap
+REP_WINDOW_S = 300.0            # last_adaptive: look at the cap over this much recent play ...
+REP_QUANTILE = 0.75             # ... and save this (time-weighted) percentile of it, not the value at exit
+REP_MIN_S = 30.0                # with less representative play than this, the saved value is left alone
 LATE_FACTOR, LATE_SLACK_MS = 1.10, 1.0
 HITCH = 1.6                     # backup rule: present intervals between deadline and HITCH intervals are late
 DROP_AT = 0.05                  # ... and more than this fraction of them in the last second drops the cap
@@ -462,6 +470,59 @@ def persist_adaptive(run_key, cap, persisted):
             log(f"cannot save settings for {run_key}: {e}")
 
 
+class Tracker:
+    """measurement state for one followed game"""
+
+    def __init__(self, run):
+        self.run = run
+        self.key = run.key            # the run file (and its mapping) may be gone when we need it
+        self.samples = []              # (ns, cap, seconds) of representative, active play
+        self.last_sample_ns = None
+        self.reset()
+
+    def reset(self):
+        """a new measurement window (target switch, pause, frame gap)"""
+        self.frames = []               # (present_ns, frame_ns, work_ns) of the last TAIL_LONG seconds
+        self.stretches = []            # [start_ns, end_ns or None] unrepresentative stretches
+        self.in_stretch = False
+        self.cap_changes = []          # (ns, cap before, cap after) of recent daemon changes
+        self.above_since = None
+        self.climb_from = None         # when the next climb step is due
+        self.climb = None              # cap where the current climb burst started
+        self.last_sample_ns = None
+
+    def representative(self):
+        """frames outside the unrepresentative stretches"""
+        if not self.stretches:
+            return self.frames
+        return [f for f in self.frames
+                if not any(a <= f[0] and (b is None or f[0] < b) for a, b in self.stretches)]
+
+    def end_climb(self, cap, why):
+        if self.climb is not None:
+            log(f"climb {why}: {self.climb} -> {cap}")
+        self.climb = self.climb_from = None
+
+    def representative_cap(self):
+        """time-weighted REP_QUANTILE of the cap over the last REP_WINDOW_S of representative play,
+        or None with less than REP_MIN_S of it"""
+        total = sum(dt for _, _, dt in self.samples)
+        if total < REP_MIN_S:
+            return None
+        acc = 0.0
+        for cap, dt in sorted((c, d) for _, c, d in self.samples):
+            acc += dt
+            if acc >= REP_QUANTILE * total:
+                return cap
+        return None
+
+
+def persist_tracker(tr, persisted):
+    cap = tr.representative_cap()
+    if cap:
+        persist_adaptive(tr.key, cap, persisted)
+
+
 def daemon():
     try:
         with open(PIDFILE) as f:
@@ -477,9 +538,9 @@ def daemon():
     migrate()
 
     log(f"daemon started: min cap {MIN_CAP}, max cap {max_cap()}, margin {MARGIN}")
-    cache, known, persisted = {}, {}, {}     # known: run path -> (key, cap, adaptive) of live runs
-    st, seq, frames, paused = None, 0, [], "no game yet"
-    changed_ns, above_since = 0, None
+    cache, known, persisted, trackers = {}, {}, {}, {}   # known: run path -> (key, adaptive) of live runs
+    st, tr, seq, paused = None, None, 0, "no game yet"
+    changed_ns = 0
     last_frame_s, last_persist = time.monotonic(), 0.0
     window, window_s = None, 0.0
     while True:
@@ -487,13 +548,14 @@ def daemon():
         now_s = time.monotonic()
         runs = scan_runs(cache)
 
-        # games that exited: save where adaptive mode had settled
+        # games that exited: save where representative play had settled
         for path in [p for p in known if p not in cache]:
-            key, cap, adaptive = known.pop(path)
-            if adaptive:
-                persist_adaptive(key, cap, persisted)
+            key, adaptive = known.pop(path)
+            gone = trackers.pop(path, None)
+            if adaptive and gone is not None:
+                persist_tracker(gone, persisted)
         for r in runs:
-            known[r.path] = (r.key, r.cap, bool(r.flags & ADAPTIVE))
+            known[r.path] = (r.key, bool(r.flags & ADAPTIVE))
 
         if now_s - window_s > 1.0:
             window, window_s = hypr_active(), now_s
@@ -504,21 +566,32 @@ def daemon():
         if tgt is None:
             if st is not None:
                 log("no game running")
-            st, frames, above_since, paused = None, [], None, "no game running"
+            st, tr, paused = None, None, "no game running"
             continue
         if st is None or tgt.path != st.path:        # another game: start measuring afresh
-            if st is not None and st.path in cache and st.flags & ADAPTIVE:
-                persist_adaptive(st.key, st.cap, persisted)
-            st, seq, frames, above_since, changed_ns = tgt, 0, [], None, 0
+            if tr is not None and st.path in cache and st.flags & ADAPTIVE:
+                persist_tracker(tr, persisted)
+            st = tgt
+            tr = trackers.setdefault(st.path, Tracker(st))
+            tr.reset()
+            seq, changed_ns = 0, 0
             last_frame_s, last_persist = now_s, now_s
             log(f"following {st.key} (pid {st.pid}), cap {st.cap}")
+
+        # an adaptive game with no cap (first launch without a saved value, or a fixed MAX_CAP that
+        # the layer could not resolve) starts at the ceiling; lowering is immediate, raising is slow
+        if st.flags & ADAPTIVE and st.cap <= 0:
+            cap_start = st.set_cap(max_cap())
+            changed_ns = time.monotonic_ns()
+            log(f"{st.key} started adaptive and uncapped: cap set to {cap_start} (MAX_CAP)")
 
         prev_seq = seq
         new, seq, pid = st.frames_since(seq)
         if seq != prev_seq:
             last_frame_s = now_s
         if seq < prev_seq:                           # restarted under the same path
-            frames, above_since, changed_ns = [], None, 0
+            tr.reset()
+            changed_ns = 0
 
         why = None
         if not st.flags & ADAPTIVE:
@@ -528,11 +601,12 @@ def daemon():
         elif not_fullscreen(window):
             why = "active window is not fullscreen"
         if why:
-            frames, above_since = [], None
+            tr.end_climb(st.cap, "stopped (paused)")
+            tr.reset()
             if why != paused and why != "manual mode":
                 log(f"paused: {why}")
                 if st.flags & ADAPTIVE:
-                    persist_adaptive(st.key, st.cap, persisted)
+                    persist_tracker(tr, persisted)
             paused = why
             continue
         if paused:
@@ -540,19 +614,59 @@ def daemon():
                 log(f"resumed {st.key}, cap {st.cap}")
             paused = None
         if now_s - last_persist >= PERSIST_S:
-            persist_adaptive(st.key, st.cap, persisted)
+            persist_tracker(tr, persisted)
             last_persist = now_s
 
         now_ns = time.monotonic_ns()  # CLOCK_MONOTONIC, the layer's clock for present_ns
         for f in new:
             if f[1] > BREAK_MS * 1e6:   # alt-tab, minimised, loading: not part of the scene, start over
-                frames, above_since = [], None
+                tr.end_climb(st.cap, "stopped (frame gap)")
+                tr.frames, tr.stretches, tr.in_stretch, tr.above_since = [], [], False, None
+                tr.last_sample_ns = None
             else:
-                frames.append(f)
-        frames = [f for f in frames if f[0] > now_ns - TAIL_LONG * 1e9]
+                tr.frames.append(f)
+        tr.frames = [f for f in tr.frames if f[0] > now_ns - TAIL_LONG * 1e9]
+        tr.stretches = [x for x in tr.stretches if x[1] is None or x[1] > now_ns - TAIL_LONG * 1e9]
+        tr.cap_changes = [c for c in tr.cap_changes if c[0] > now_ns - 5e9]
+        cap = st.cap
+
+        # Unrepresentative stretch (loading, login, zoning, menus with stalls): the game delivers
+        # under half the cap. Decide nothing and keep those frames out of both tail windows.
+        last_second = sorted(f[1] for f in tr.frames if f[0] > now_ns - 1e9 and f[1] > 0)
+        if last_second:
+            median_ms = last_second[len(last_second) // 2] / 1e6
+            unrep = median_ms > UNREP_FACTOR * 1000 / cap
+            if unrep and not tr.in_stretch:
+                start = now_ns - 1e9               # the window that revealed it
+                tr.stretches.append([start, None])
+                tr.in_stretch = True
+                tr.end_climb(cap, "stopped (unrepresentative stretch)")
+                # the detection lags by up to a second: undo drops it caused meanwhile
+                lowered = [c for c in tr.cap_changes if c[0] > start]
+                if lowered and lowered[0][1] > cap:
+                    cap = st.set_cap(lowered[0][1])
+                    changed_ns = now_ns
+                    log(f"restored cap {cap}: drop made while the stretch was starting")
+                log(f"unrepresentative stretch: median present interval {median_ms:.1f} ms is over "
+                    f"{UNREP_FACTOR:g}x the {1000 / cap:.1f} ms cap interval; deciding nothing")
+            elif not unrep and tr.in_stretch:
+                # the last second still holds the tail of the stretch, which is why it only just looked
+                # representative: leave it out too
+                tr.stretches[-1][1] = now_ns
+                tr.in_stretch = False
+                log(f"representative again (median present interval {median_ms:.1f} ms)")
+        if tr.in_stretch:
+            tr.above_since = None
+            tr.last_sample_ns = None
+            continue
+
+        frames = tr.representative()
+        dt = min((now_ns - tr.last_sample_ns) / 1e9, 1.0) if tr.last_sample_ns else TICK
+        tr.last_sample_ns = now_ns
+        tr.samples.append((now_ns, cap, dt))
+        tr.samples = [x for x in tr.samples if x[0] > now_ns - REP_WINDOW_S * 1e9]
         if len(frames) < 60:
             continue
-        cap = st.cap
 
         def tail(seconds, q):
             work = sorted(f[2] / 1e6 for f in frames if f[0] > now_ns - seconds * 1e9 and f[2] / 1e6 < LOADING_MS)
@@ -566,26 +680,40 @@ def daemon():
 
         # backup: frames actually arriving modestly late under the current cap
         recent = [f[1] / 1e6 for f in frames if f[0] > max(now_ns - 1e9, changed_ns)]
-        interval = 1000 / cap if cap else 1000 / max_cap()
+        interval = 1000 / cap
         late = sum(interval * LATE_FACTOR + LATE_SLACK_MS < v < interval * HITCH for v in recent) / max(len(recent), 1)
         if len(recent) >= 20 and late >= DROP_AT and cap > MIN_CAP:
             achieved = 1000 / (sum(recent) / len(recent))
             target = min(target, int(achieved * 0.96))
 
-        new_cap, why = None, ""
-        if cap <= 0:        # unlimited: take the target straight away instead of climbing from the floor
-            new_cap, why = st.set_cap(target), "start"
-        elif target < cap:
+        new_cap = None
+        if target < cap:
             new_cap, why = st.set_cap(target), "tail grew" if late < DROP_AT else f"{late:.0%} late"
-            above_since = None
+            tr.above_since = None
+            tr.end_climb(cap, "interrupted by a drop")
         elif target > cap:
-            above_since = above_since or now_ns
-            if (now_ns - above_since) / 1e9 >= RISE_HOLD and (now_ns - changed_ns) / 1e9 >= RISE_STEP:
-                new_cap, why = st.set_cap(cap + 1), "tail short"
+            far = target - cap >= CLIMB_FAR_GAP
+            hold, step = (RISE_HOLD_FAR, RISE_STEP_FAR) if far else (RISE_HOLD, RISE_STEP)
+            tr.above_since = tr.above_since or now_ns
+            if (now_ns - tr.above_since) / 1e9 >= hold:
+                if tr.climb_from is None:
+                    tr.climb_from = tr.above_since + int(hold * 1e9)
+                steps = int((now_ns - tr.climb_from) / (step * 1e9))
+                if steps >= 1:
+                    steps = min(steps, target - cap)
+                    new_cap = st.set_cap(cap + steps)
+                    tr.climb_from += int(steps * step * 1e9)
+                    if tr.climb is None:
+                        tr.climb = cap
+                        log(f"climbing {cap} -> {target}: p99/30s {long_tail:.1f} ms, "
+                            f"p95/2s {short_tail or 0:.1f} ms")
         else:
-            above_since = None
+            tr.above_since = None
+            tr.end_climb(cap, "reached the target")
         if new_cap is not None and new_cap != cap:
-            log(f"{cap} -> {new_cap}: {why}; p99/30s {long_tail:.1f} ms, p95/2s {short_tail or 0:.1f} ms, target {target}")
+            if tr.climb is None:               # a drop: one line each
+                log(f"{cap} -> {new_cap}: {why}; p99/30s {long_tail:.1f} ms, p95/2s {short_tail or 0:.1f} ms, target {target}")
+            tr.cap_changes.append((now_ns, cap, new_cap))
             changed_ns = now_ns
 
 
@@ -678,10 +806,11 @@ def main(argv):
     load_config()
     migrate()
     cache = {}
+    if cmd == "daemon":
+        daemon()            # not inside the usage-error handler below: show real tracebacks
+        return 0
     try:
-        if cmd == "daemon":
-            daemon()
-        elif cmd == "list":
+        if cmd == "list":
             cmd_list(cache)
         elif cmd == "status":
             runs = scan_runs(cache)
