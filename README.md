@@ -435,7 +435,7 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   (run files of dead pids are removed). It pauses when no new frame arrived for 1 s, and
   resets its windows when the target changes. A frame gap over 250 ms (alt-tab,
   minimised, loading) is a break: the gap is not counted and the measurement window
-  restarts. Optionally, on Hyprland (`PAUSE_WHEN_NOT_FULLSCREEN`), it also pauses while
+  restarts (with a settle period, below). Optionally, on Hyprland (`PAUSE_WHEN_NOT_FULLSCREEN`), it also pauses while
   the active window is not fullscreen. Games in manual or off mode are left alone, as are
   all games that are not the target.
 - **Starting high.** A game in adaptive mode with no cap (a first launch without a saved
@@ -446,15 +446,24 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   raising is the slow path.
 - **Ignoring unrepresentative stretches.** Loading, login, zoning and menus with stalls do
   not say how heavy the game is. If the median present interval over the last second is
-  more than **2x the interval of the current cap** (the game delivers under half the cap)
-  **and over 25 ms** (under 40 fps), the stretch is unrepresentative: the daemon decides nothing, and the frames of the
-  stretch stay out of both tail windows (frames are tagged by time, and also the last
-  second before detection and the last second before it ends). Detection lags by up to a
-  second, so a drop made while the stretch was starting is undone and the cap is back where
-  it was. Entering and leaving are logged once each. The 25 ms floor keeps a heavy game
-  that simply plays at 45-60 fps out of this state, so it still gets an even cap; only a
-  game that sits below 40 fps the whole time stays uncapped, and that is under the 48 Hz
-  floor of most VRR panels anyway.
+  more than **2x the interval of the current cap** *and* over **25 ms** (so heavy games at
+  40 to 60 fps are still capped), the stretch is unrepresentative: the daemon decides
+  nothing. Detection lags by up to a second, so a drop made while the stretch was starting
+  is undone and the cap is back where it was. Entering and leaving are logged once each.
+  A game that always runs at under 40 fps and under half of its cap stays in this state; it
+  is then effectively uncapped, which is harmless at those frame rates.
+- **Settling after a transition.** Loading and login screens mix normal frames with 20-40 ms
+  spikes, so their median looks normal and the stretch rule above only catches the slow
+  parts. The spiky frames in between would enter the 30 s tail, drag the cap to the minimum,
+  and keep it there until they aged out, which is half a minute after reaching the world.
+  So after every **transition** (following a new game, resuming after a pause because
+  frames stopped or the window left fullscreen, the end of an unrepresentative stretch, or a
+  frame gap over 250 ms) the daemon settles for **10 s** (restarting if another transition
+  happens inside it). While settling, frames are never added to the tail windows, nothing
+  climbs, and the cap may fall only through the late-frame backup (frames really arriving
+  late under the current cap). The daemon logs `settling for 10 s (reason)` and `settled`.
+  Afterwards decisions use only post-settle frames, at least 60 of them, and climbing keeps
+  its holds.
 - **Target cap.** From the last 30 s of representative frames, the 99th percentile of
   `work_ns` (window and percentile exist because crowds burst every 20-30 s) and, from the
   last 2 s, the 95th percentile (so walking into a crowd lowers the cap within a second or
@@ -471,7 +480,7 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   late (between 1.10 x interval + 1 ms and 1.6 x interval) the cap drops to 96% of the fps
   actually achieved.
 - **What `last_adaptive` means.** It is not the cap at exit. The daemon tracks the cap
-  over the last 5 minutes of representative, active play (paused and unrepresentative
+  over the last 5 minutes of representative, active play (paused, settling and unrepresentative
   time is left out) and saves its time-weighted **75th percentile**, so a game that ends in
   a loading screen or a heavy zone starts the next time near its usual cap. With less than
   30 s of such play the saved value is left alone. It is saved when the daemon pauses, when

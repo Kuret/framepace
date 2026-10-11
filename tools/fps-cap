@@ -34,7 +34,9 @@ up as a heavier tail and lower the cap at once. An uncapped adaptive game starts
 target 10+ fps above the cap is climbed to after a 2 s hold at +1 per 0.1 s, a closer one after a
 5 s hold at +1 per 0.5 s. Single frames over 100 ms (loading) are left out of the tail, and so
 is any stretch where the median present interval over the last second exceeds twice the cap's
-interval (loading screens, menus with stalls): nothing is decided then. As a backup, more than 5%
+interval and 25 ms (loading screens, menus with stalls): nothing is decided then. After every
+transition (new game, resume after a pause, end of such a stretch, a frame gap) it settles for 10 s:
+frames are not measured, nothing climbs, and only the late-frame backup may lower the cap. As a backup, more than 5%
 modestly late frames in a second drops the cap to just under what the game achieved. last_adaptive
 is the time-weighted 75th percentile of the cap over the last 5 minutes of representative play,
 not the value at exit.
