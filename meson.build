@@ -76,6 +76,13 @@ test_game = executable('test_game', 'tests/test_game.c', 'src/game.c', 'src/gate
   build_by_default : false)
 test('game key and settings', test_game)
 
+test_limiter = executable('test_limiter', 'tests/test_limiter.c', 'src/limiter.c', 'src/util.c',
+  c_args : ['-D_GNU_SOURCE'], dependencies : [thread_dep],
+  build_by_default : false)
+test('limiter pace', test_limiter)
+
+test('adaptive policy', find_program('python3'), args : [files('tests/test_adapt.py')])
+
 # Manual HDR swapchain harness (needs a Wayland session): `ninja -C build hdr_swapchain`.
 # Not built by default, and skipped when the Wayland development files are missing.
 wl_client = dependency('wayland-client', required : false)

@@ -321,15 +321,19 @@ pressure-vessel container imports it and remaps the host library path.
 Behaves like MangoHud's `fps_limit_method=early`, run inside `vkQueuePresentKHR` when
 `cap > 0`:
 
-1. The deadline advances by `1e9 / cap` per frame (a fixed grid, so jitter in one frame
-   does not shift the next).
+1. Once the paced interval matches the cap, the deadline advances by `1e9 / cap` per
+   frame (a fixed grid, so jitter in one frame does not shift the next).
 2. If the frame is already more than one interval past the deadline, the grid resyncs to
    now.
 3. Otherwise sleep with `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)` until
    `deadline - 300 us`, then spin (`_mm_pause`, with an occasional `sched_yield`) up to
    the deadline.
-4. When the cap changes, the grid restarts from the last present time, so the schedule
-   continues without a jump. The new cap applies from the next frame.
+4. When the cap changes, the paced interval moves by at most 0.4 ms per frame toward
+   `1e9 / cap`. A large drop or climb is a ramp, not one stretched or shortened frame.
+   A frame that is already more than 1 ms late, while the new cap is slower, is presented
+   immediately and the interval snaps the rest of the way: a drop does not add wait to a
+   frame that has already missed. Once the interval matches the cap, the fixed grid
+   resumes, so present jitter does not shift the frames after that.
 
 With `cap <= 0` there is no wait at all.
 
@@ -460,18 +464,24 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   frames stopped or the window left fullscreen, the end of an unrepresentative stretch, or a
   frame gap over 250 ms) the daemon settles for **10 s** (restarting if another transition
   happens inside it). While settling, frames are never added to the tail windows and the
-  cap neither climbs nor drops, not even through the late-frame backup: in World of Warcraft
-  the login screen and the first seconds of streaming in a world deliver late frames that
-  say nothing about gameplay, and the backup dragged the cap from 77 to 50 there. A cap that
-  is briefly too high only lets the game pace itself for at most 10 s. The daemon logs
-  `settling for 10 s (reason)` and `settled`.
-  Afterwards decisions use only post-settle frames, at least 60 of them, and climbing keeps
-  its holds.
+  cap does not climb. One late-frame notch is allowed, once: if frames are actually late
+  and achieved fps is still over 85% of the cap, the cap drops to the higher of 96% of
+  achieved and 90% of the cap. A login screen running far below the cap is left alone; in
+  World of Warcraft that backup used to drag the cap from 77 to 50 on frames that said
+  nothing about gameplay. The daemon logs `settling for 10 s (reason)`, `settle drop` when
+  the notch happens, and `settled`. Afterwards decisions use only post-settle frames, at
+  least 60 of them, and climbing keeps its holds.
 - **Target cap.** From the last 30 s of representative frames, the 99th percentile of
   `work_ns` (window and percentile exist because crowds burst every 20-30 s) and, from the
   last 2 s, the 95th percentile (so walking into a crowd lowers the cap within a second or
-  two). The worse of the two sets `target = 1000 / (worst_ms * MARGIN)`, clamped to
-  `MIN_CAP`..`MAX_CAP`. At least 60 frames in the window are needed.
+  two). Each becomes a cap with `1000 / (work_ms * MARGIN)`, clamped to `MIN_CAP`..`MAX_CAP`.
+  When both windows agree, the lower cap wins. When the 2 s cap is more than 2 fps above
+  the 30 s cap and still above the current cap, the 30 s tail is stale or between crowds:
+  the target moves to at most 12 fps above the 30 s cap, and only at the slow rise rate.
+  A cap already above that ceiling drops to it, not all the way to the 30 s cap. A
+  repeating crowd therefore cannot be unwound between bursts, and leaving one does not
+  wait out the whole 30 s before anything moves. A 30 s window that is beyond `MIN_CAP`
+  does not creep. At least 60 frames in the window are needed.
 - **Hitches no cap can absorb.** A frame whose work (with the margin) would not fit even at
   `MIN_CAP` (19 ms at 50 fps) hitches at any cap, so lowering the cap does nothing for it.
   As long as such frames are rare (at most 5% of the window) they are left out of the tails:
@@ -479,12 +489,24 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   minimum while 99% of frames needed under 9 ms. When more than 5% of frames are beyond
   reach, they are not rare hitches but the game's actual load, and the target is `MIN_CAP`.
   The log shows the share as "beyond reach".
-- **Moving the cap.** It lowers immediately to the target. Raising has two speeds. If the
-  target is **10 fps or more** above the cap, it waits until the target has stayed above
-  the cap for **2 s**, then climbs by +1 every **0.1 s** (50 to 120 takes about 9 s). Closer
-  than that, the hold is **5 s** and the step is +1 per **0.5 s**. Any drop condition resets
-  the hold. A climb is logged as one line when it starts (`climbing 50 -> 121`) and one when
+- **Moving the cap.** It lowers immediately to the target, but a target only 1 fps under
+  the cap is held: that is the percentile bouncing on a rounding boundary, and dropping it
+  would sawtooth against the 5 s rise hold. Raising has two speeds, and only when both
+  windows agree does the fast one apply. If the target is **10 fps or more** above the cap,
+  it waits until the target has stayed above the cap for **2 s**, then climbs by **+2 fps
+  per 0.25 s tick**. Closer than that, and whenever the windows disagree (the creep above),
+  the hold is **5 s** and the step is +1 per **0.5 s**, at most +1 per tick. A late tick
+  drops the steps it missed instead of writing them in one go. The limiter then slews the
+  interval (see [The limiter](#the-limiter)), so those steps are not one-frame jumps
+  either. Any drop condition resets the
+  hold. A climb is logged as one line when it starts (`climbing 50 -> 121`) and one when
   it ends; drops are logged one line each.
+- **Work that is just the cap.** If the median present interval over the last second is
+  within 0.5 ms of the cap and the median work time is over 90% of that interval, the
+  measurement is the pace itself (the game blocked on the previous present, or its own
+  limiter). The tail is not allowed to lower the cap; that would ratchet toward `MIN_CAP`
+  because the next window would fill the new interval too. Frames that are actually late
+  still drop through the late-frame backup. The daemon logs the hold once per episode.
 - **Late-frame backup.** If more than 5% of the presents in the last second were modestly
   late (between 1.10 x interval + 1 ms and 1.6 x interval) the cap drops to 96% of the fps
   actually achieved.
@@ -503,11 +525,16 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
 | Unrepresentative stretch | median interval over 1 s > 2 x the cap interval and > 25 ms | fixed |
 | Long tail | p99 over 30 s | fixed |
 | Short tail | p95 over 2 s | fixed |
-| Rise, target 10+ fps above the cap | hold 2 s, +1 per 0.1 s | fixed |
-| Rise, closer | hold 5 s, +1 per 0.5 s | fixed |
+| Rise, both windows agree, target 10+ fps above | hold 2 s, then +2 fps per 0.25 s tick | fixed |
+| Rise, closer, or windows disagree | hold 5 s, +1 per 0.5 s, at most +1 per tick | fixed |
+| Creep while the 30 s tail is heavier | at most 12 fps above the long-window cap, slow rate | fixed |
+| Drop deadband | hold when the target is 1 fps under the cap | fixed |
+| Work tracking the cap interval | do not lower | fixed |
 | Rare hitches beyond reach (excluded from tails) | work × MARGIN > 1000 / MIN_CAP, up to 5% of frames | follows MIN_CAP and MARGIN |
 | Break gap / stall | 250 ms / 1 s | fixed |
 | Late-frame backup | >5% late, cap to 96% of achieved | fixed |
+| Settle late notch | once, to the higher of 96% achieved and 90% of the cap, only if achieved > 85% of the cap | fixed |
+| Limiter interval slew | 0.4 ms per frame; snap if already >1 ms late while dropping | fixed |
 | `last_adaptive` | p75 of the cap over 5 min of representative play, needs 30 s | fixed |
 
 ## Troubleshooting
@@ -537,7 +564,9 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
 - **gamescope.** framepace deliberately does nothing inside gamescope, to avoid double
   limiting; use gamescope's own limiter there.
 - **The cap seems stuck low.** Adaptive mode lowers the cap whenever frames get heavy and
-  raises it slowly (5 s hold, then +1 per 0.5 s). `fps-cap status` shows the limits; use
+  raises it slowly (5 s hold, then +1 per 0.5 s). While the 30 s tail is still heavier than
+  the last 2 s it only creeps 12 fps above that tail, then waits for the long window to
+  agree. `fps-cap status` shows the limits; use
   `fps-cap set N` or `fps-cap off` for manual control. The daemon logs each change to
   `~/.cache/framepace/fps-cap.log` and to the journal
   (`journalctl --user -u framepace.service`).

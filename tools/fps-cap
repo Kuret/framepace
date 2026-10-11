@@ -29,16 +29,24 @@ that is not running, only its saved settings change.
 Adaptive mode follows the target game. The layer reports, per frame, how long it took from
 release to finished rendering (CPU and GPU together). The cap follows the slow tail of those
 times, so it sits where nearly every frame fits: the 99th percentile of the last 30 s and the 95th
-of the last 2 s (whichever needs the lower cap), plus a 5% margin. Busy scenes such as crowds show
-up as a heavier tail and lower the cap at once. An uncapped adaptive game starts at MAX_CAP. A
-target 10+ fps above the cap is climbed to after a 2 s hold at +1 per 0.1 s, a closer one after a
-5 s hold at +1 per 0.5 s. Frames that would not fit even at MIN_CAP are hitches no cap can absorb;
-while they are under 5% of frames they are left out of the tail (above that the target is MIN_CAP),
-and so is any stretch where the median present interval over the last second exceeds twice the cap's
-interval and 25 ms (loading screens, menus with stalls): nothing is decided then. After every
-transition (new game, resume after a pause, end of such a stretch, a frame gap) it settles for 10 s:
-frames are not measured and the cap neither climbs nor drops. Outside settling, as a backup, more than 5%
-modestly late frames in a second drops the cap to just under what the game achieved. last_adaptive
+of the last 2 s, plus a 5% margin. When both agree, the worse one wins. When the last 2 s is lighter,
+the cap creeps at the slow rate to at most 12 fps above the 30 s tail, then waits for that window to
+agree before climbing faster. Busy scenes lower the cap at once, except a target only 1 fps under the
+cap (that is percentile noise) and except when work time is just the cap interval itself: lowering
+then would ratchet, because the next window fills the new interval too. An uncapped adaptive game
+starts at MAX_CAP. A target 10+ fps above the cap, with both windows agreeing, is climbed after a 2 s
+hold by +2 fps per tick. Anything closer uses a 5 s hold and +1 per 0.5 s, at most +1 per tick. A
+late tick drops the steps it missed instead of writing them at once. The limiter slews the frame
+interval by at most 0.4 ms
+per frame, so the new cap is not one stretched frame. Frames that would not fit even at MIN_CAP are
+hitches no cap can absorb; while they are under 5% of frames they are left out of the tail (above
+that the target is MIN_CAP), and so is any stretch where the median present interval over the last
+second exceeds twice the cap's interval and 25 ms (loading screens, menus with stalls): nothing is
+decided then. After every transition (new game, resume after a pause, end of such a stretch, a frame
+gap) it settles for 10 s: frames are not measured and the cap does not climb. Once during that settle,
+if frames are actually late and the game is still achieving close to the cap, the cap drops by at most
+10%. Outside settling, more than 5% modestly late frames in a second drops the cap to just under what
+the game achieved. last_adaptive
 is the time-weighted 75th percentile of the cap over the last 5 minutes of representative play,
 not the value at exit.
 The daemon pauses when no new frame arrived for 1 s or (Hyprland only, optional) the active window
@@ -102,6 +110,19 @@ RARE_HITCH = 0.05               # frames that would not fit even at MIN_CAP are 
 RISE_HOLD, RISE_STEP = 5.0, 0.5 # target must stay above the cap this long; then +1 per RISE_STEP s
 CLIMB_FAR_GAP = 10              # target this far above the cap (fps): climb fast ...
 RISE_HOLD_FAR, RISE_STEP_FAR = 2.0, 0.1   # ... after a shorter hold, +1 per 0.1 s
+CLIMB_MAX_STEP, CLIMB_MAX_STEP_FAR = 1, 2  # a tick never applies more than this many fps, even when
+                                           # it is late and the backlog is longer; the rest is dropped
+CREEP_MAX = 12              # while the 30 s tail still wants a lower cap than the last 2 s, rise
+                            # (at the slow rate only) to at most this far above the long-window cap,
+                            # then wait for that window to agree before the fast climb
+DROP_BAND = 1               # a target this close under the cap is percentile noise: hold, don't drop
+PACE_TOL_MS = 0.5           # median present interval within this of the cap: the limiter is holding it
+PACE_WORK = 0.90            # median work above this fraction of that interval is the pace, not the scene.
+                            # Lowering would ratchet: the next window fills the new interval too
+SETTLE_DROP = 0.90          # during settle the late-frame backup may lower the cap, but only to this
+                            # fraction of it, and only once per settle ...
+SETTLE_NEAR = 0.85          # ... and only when achieved fps is still at least this fraction of the cap.
+                            # A login screen at 50 under a cap of 77 is left alone
 UNREP_FACTOR = 2.0              # a stretch is unrepresentative (loading, login, zoning, menus with stalls)
                                 # when the median present interval over the last second is more than this
                                 # many times the cap's interval, i.e. the game delivers under half the cap,
@@ -109,11 +130,12 @@ UNREP_MIN_MS = 25.0             # ... and is also slower than this (under 40 fps
                                 # are far slower; a heavy game playing at 45-60 fps must still get capped,
                                 # instead of staying in this state at a high starting cap
 SETTLE_S = 10.0                 # after every transition (new game, resume after a pause, end of a stretch,
-                                # frame gap) frames are not measured and only the late-frame backup may
-                                # lower the cap, nothing climbs. Login and loading screens mix normal frames
-                                # with 20-40 ms spikes: the median looks fine, but the spikes would enter the
-                                # 30 s tail, pin the cap at the minimum and keep it there until they age out.
-                                # Restarts when another transition happens inside it.
+                                # frame gap) frames are not measured and the cap does not climb. One
+                                # late-frame notch is allowed (settle_notch): at most 10%, and only when
+                                # the game is still achieving close to the cap. Login screens that run far
+                                # below it used to drag the cap from 77 to 50. The spikes would also enter
+                                # the 30 s tail and pin the cap until they aged out. Restarts when another
+                                # transition happens inside it.
 REP_WINDOW_S = 300.0            # last_adaptive: look at the cap over this much recent play ...
 REP_QUANTILE = 0.75             # ... and save this (time-weighted) percentile of it, not the value at exit
 REP_MIN_S = 30.0                # with less representative play than this, the saved value is left alone
@@ -212,6 +234,91 @@ def max_cap():
 
 def clamp_cap(cap):
     return max(MIN_CAP, min(max_cap(), cap))
+
+
+def cap_from_work(work_ms):
+    """fps that fits work_ms with MARGIN, clamped. None if there is no sample.
+    inf means the frames do not fit even at MIN_CAP."""
+    if work_ms is None or work_ms <= 0:
+        return None
+    if work_ms == float("inf"):
+        return MIN_CAP
+    return max(MIN_CAP, min(max_cap(), int(1000 / (work_ms * MARGIN))))
+
+
+def combine_targets(long_tail, short_tail, cap):
+    """(target, far) from the 30 s and 2 s tails, or (None, False) with no long sample.
+
+    Both windows agree: the target is the worse of the two. far is true when that
+    target is CLIMB_FAR_GAP or more above the cap, which is the fast climb.
+    The 2 s window is lighter by more than 2 fps and still above the cap: the 30 s
+    tail is stale or between crowds. Creep to at most long_cap + CREEP_MAX, always
+    at the slow rate. A long window that is beyond MIN_CAP does not creep.
+    """
+    long_cap = cap_from_work(long_tail)
+    if long_cap is None:
+        return None, False
+    short_cap = cap_from_work(short_tail)
+    if short_cap is None:
+        short_cap = long_cap
+    if long_tail != float("inf") and short_cap > long_cap + 2 and short_cap > cap:
+        return min(short_cap, long_cap + CREEP_MAX), False
+    target = min(long_cap, short_cap)
+    return target, target - cap >= CLIMB_FAR_GAP
+
+
+def climb_steps(elapsed_ns, step_s, room, far):
+    """fps to add this tick. A late tick does not dump its backlog; the caller
+    restarts the step clock from now, so the leftover is dropped."""
+    step_ns = int(step_s * 1e9)
+    if step_ns <= 0 or room < 1 or elapsed_ns < step_ns:
+        return 0
+    cap_steps = CLIMB_MAX_STEP_FAR if far else CLIMB_MAX_STEP
+    return min(elapsed_ns // step_ns, room, cap_steps)
+
+
+def cap_move(cap, target):
+    """'drop', 'climb' or 'hold'. A target DROP_BAND fps under the cap is noise."""
+    if target < cap - DROP_BAND:
+        return "drop"
+    if target > cap:
+        return "climb"
+    return "hold"
+
+
+def pacing_itself(med_work_ms, med_frame_ms, cap):
+    """True when present intervals are the cap and work is just that pace."""
+    if cap <= 0 or not med_work_ms or not med_frame_ms:
+        return False
+    interval = 1000 / cap
+    paced = abs(med_frame_ms - interval) < PACE_TOL_MS
+    following = med_work_ms > PACE_WORK * med_frame_ms
+    return paced and following
+
+
+def settle_notch(cap, backup):
+    """one limited settle drop, or None.
+
+    backup is 96% of achieved fps (what the late-frame backup computes), or None.
+    Login screens that achieve well under the cap are left alone. A crowd still
+    close to the cap drops to the higher of that backup and SETTLE_DROP of the cap.
+    """
+    if backup is None or cap <= MIN_CAP or backup >= cap:
+        return None
+    achieved = backup / 0.96
+    if achieved <= cap * SETTLE_NEAR:
+        return None
+    notch = min(max(backup, int(cap * SETTLE_DROP)), cap - 1)
+    if notch >= cap:
+        return None
+    return max(MIN_CAP, notch)
+
+
+def median(vals):
+    if not vals:
+        return None
+    vals = sorted(vals)
+    return vals[len(vals) // 2]
 
 
 # --- saved per-game settings ------------------------------------------------------------------
@@ -510,6 +617,8 @@ class Tracker:
         self.above_since = None
         self.climb_from = None         # when the next climb step is due
         self.climb = None              # cap where the current climb burst started
+        self.settle_dropped = False    # the one late notch of this settle has been used
+        self.tracking_pace = False     # work is the cap interval; tail drops are suppressed
         self.last_sample_ns = None
 
     def representative(self):
@@ -519,6 +628,8 @@ class Tracker:
     def start_settle(self, now_ns, reason):
         """a transition: measure nothing for SETTLE_S (restarts if already settling)"""
         self.settle_until = now_ns + int(SETTLE_S * 1e9)
+        self.settle_dropped = False
+        self.tracking_pace = False
         self.above_since = None
         self.last_sample_ns = None
         if not self.settling:
@@ -703,12 +814,20 @@ def daemon():
             return late, None
 
         if tr.settling:
-            # Settling after a transition: nothing is measured, nothing climbs and nothing drops.
-            # Even the late-frame backup stays off: in WoW, login screens and the first seconds of
-            # streaming in a world deliver late frames that say nothing about gameplay, and dragged
-            # the cap from 77 to 50. A cap that is briefly too high only lets the game set its own
-            # pace for at most SETTLE_S.
+            # Nothing is measured and nothing climbs. One late notch is allowed when the game
+            # is actually missing a cap it is still close to. A login screen far below the cap
+            # used to drag 77 down to 50 through this backup; settle_notch refuses that.
             tr.end_climb(cap, "stopped (settling)")
+            if not tr.settle_dropped:
+                late, backup = late_backup(tr.frames)
+                notch = settle_notch(cap, backup)
+                if notch is not None:
+                    new_cap = st.set_cap(notch)
+                    if new_cap != cap:
+                        tr.settle_dropped = True
+                        tr.cap_changes.append((now_ns, cap, new_cap))
+                        changed_ns = now_ns
+                        log(f"settle drop {cap} -> {new_cap}: {late:.0%} late, achieved still near the cap")
             continue
 
         frames = tr.representative()
@@ -733,32 +852,44 @@ def daemon():
             return fits[min(len(fits) - 1, int(len(fits) * q))], beyond
 
         (long_tail, long_beyond), (short_tail, _) = tail(TAIL_LONG, TAIL_LONG_Q), tail(TAIL_SHORT, TAIL_SHORT_Q)
-        if long_tail is None:
+        target, far = combine_targets(long_tail, short_tail, cap)
+        if target is None:
             continue
-        worst = max(long_tail, short_tail or 0)
-        target = MIN_CAP if worst == float("inf") else max(MIN_CAP, min(max_cap(), int(1000 / (worst * MARGIN))))
+
+        recent = [f for f in frames if f[0] > now_ns - 1e9]
+        held = pacing_itself(median([f[2] / 1e6 for f in recent if f[2] > 0]),
+                             median([f[1] / 1e6 for f in recent if f[1] > 0]), cap) and target < cap - DROP_BAND
+        if held:
+            target = cap
 
         late, backup = late_backup(frames)
         if backup is not None:
             target = min(target, backup)
+            far = far and target - cap >= CLIMB_FAR_GAP
+        # The late backup may still drop after a pace hold. Only claim the hold when it stuck.
+        if held and cap_move(cap, target) != "drop":
+            if not tr.tracking_pace:
+                log(f"work is tracking the {1000 / cap:.1f} ms cap interval, not lowering")
+            tr.tracking_pace = True
+        else:
+            tr.tracking_pace = False
 
         new_cap = None
-        if target < cap:
+        move = cap_move(cap, target)
+        if move == "drop":
             new_cap, why = st.set_cap(target), "tail grew" if late < DROP_AT else f"{late:.0%} late"
             tr.above_since = None
             tr.end_climb(cap, "interrupted by a drop")
-        elif target > cap:
-            far = target - cap >= CLIMB_FAR_GAP
+        elif move == "climb":
             hold, step = (RISE_HOLD_FAR, RISE_STEP_FAR) if far else (RISE_HOLD, RISE_STEP)
             tr.above_since = tr.above_since or now_ns
             if (now_ns - tr.above_since) / 1e9 >= hold:
                 if tr.climb_from is None:
                     tr.climb_from = tr.above_since + int(hold * 1e9)
-                steps = int((now_ns - tr.climb_from) / (step * 1e9))
+                steps = climb_steps(now_ns - tr.climb_from, step, target - cap, far)
                 if steps >= 1:
-                    steps = min(steps, target - cap)
                     new_cap = st.set_cap(cap + steps)
-                    tr.climb_from += int(steps * step * 1e9)
+                    tr.climb_from = now_ns          # a late tick's leftover steps are dropped
                     if tr.climb is None:
                         tr.climb = cap
                         log(f"climbing {cap} -> {target}: p99/30s {long_tail:.1f} ms, "
