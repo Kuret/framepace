@@ -9,7 +9,8 @@ work_ns, and the cap is read back from the file every frame, so the daemon's cha
               [--trace FILE]
 
 --phases is a comma-separated list of duration_seconds:work_ms (a 60 ms phase on a 120 fps cap is
-a "loading screen": the game delivers fewer than half the cap). Run it with HOME pointing at a
+a "loading screen": the game delivers fewer than half the cap). A phase may be spiky:
+duration:work_ms/spike_ms@fraction, e.g. 8:5/30@0.2 is 8 s of 5 ms frames of which 20% take 30 ms. Run it with HOME pointing at a
 scratch directory (and XDG_RUNTIME_DIR for the daemon's pid file). --trace appends
 "seconds phase cap" lines four times a second.
 """
@@ -34,7 +35,12 @@ def main():
     ap.add_argument("--mode", choices=("adaptive", "manual"), default="adaptive")
     ap.add_argument("--trace")
     args = ap.parse_args()
-    phases = [(float(a), float(b)) for a, b in (p.split(":") for p in args.phases.split(","))]
+    phases = []
+    for p in args.phases.split(","):
+        dur, _, spec = p.partition(":")
+        spec, _, spike = spec.partition("/")
+        spike_ms, _, frac = spike.partition("@")
+        phases.append((float(dur), float(spec), float(spike_ms or 0), float(frac or 0)))
 
     run_dir = os.path.expanduser("~/.local/state/framepace/run")
     os.makedirs(run_dir, exist_ok=True)
@@ -55,11 +61,12 @@ def main():
     present = t0
     trace = open(args.trace, "w") if args.trace else None
     next_trace = 0.0
-    for idx, (dur, work_ms) in enumerate(phases):
+    for idx, (dur, work_ms, spike_ms, spike_frac) in enumerate(phases):
         end = time.monotonic_ns() + int(dur * 1e9)
         while time.monotonic_ns() < end:
             cap = struct.unpack_from("<i", m, 8)[0]
-            work = work_ms * 1e6 * (1 + rnd.uniform(-0.03, 0.03))
+            ms = spike_ms if spike_frac and rnd.random() < spike_frac else work_ms
+            work = ms * 1e6 * (1 + rnd.uniform(-0.03, 0.03))
             frame = max(1e9 / cap if cap > 0 else 0, work)
             present += int(frame)
             delay = (present - time.monotonic_ns()) / 1e9
