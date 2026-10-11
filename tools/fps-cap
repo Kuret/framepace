@@ -32,8 +32,9 @@ times, so it sits where nearly every frame fits: the 99th percentile of the last
 of the last 2 s (whichever needs the lower cap), plus a 5% margin. Busy scenes such as crowds show
 up as a heavier tail and lower the cap at once. An uncapped adaptive game starts at MAX_CAP. A
 target 10+ fps above the cap is climbed to after a 2 s hold at +1 per 0.1 s, a closer one after a
-5 s hold at +1 per 0.5 s. Single frames over 100 ms (loading) are left out of the tail, and so
-is any stretch where the median present interval over the last second exceeds twice the cap's
+5 s hold at +1 per 0.5 s. Frames that would not fit even at MIN_CAP are hitches no cap can absorb;
+while they are under 5% of frames they are left out of the tail (above that the target is MIN_CAP),
+and so is any stretch where the median present interval over the last second exceeds twice the cap's
 interval and 25 ms (loading screens, menus with stalls): nothing is decided then. After every
 transition (new game, resume after a pause, end of such a stretch, a frame gap) it settles for 10 s:
 frames are not measured and the cap neither climbs nor drops. Outside settling, as a backup, more than 5%
@@ -94,7 +95,10 @@ FALLBACK_MAX = 138              # when the refresh rate cannot be detected (144 
 TICK = 0.25                     # seconds between decisions
 TAIL_LONG, TAIL_LONG_Q = 30.0, 0.99   # window (s) and percentile of frame work the cap must fit; crowds burst every ~20-30 s
 TAIL_SHORT, TAIL_SHORT_Q = 2.0, 0.95  # a short window, so walking into a crowd lowers the cap within ~1-2 s
-LOADING_MS = 100                # frames slower than this are loading hitches, not the scene's load
+RARE_HITCH = 0.05               # frames that would not fit even at MIN_CAP are hitches no cap can absorb;
+                                # while they stay under this fraction they are left out of the tails (a few
+                                # 37 ms spikes among 7.5 ms frames held WoW at MIN_CAP), above it the game
+                                # is genuinely that heavy and the target is MIN_CAP
 RISE_HOLD, RISE_STEP = 5.0, 0.5 # target must stay above the cap this long; then +1 per RISE_STEP s
 CLIMB_FAR_GAP = 10              # target this far above the cap (fps): climb fast ...
 RISE_HOLD_FAR, RISE_STEP_FAR = 2.0, 0.1   # ... after a shorter hold, +1 per 0.1 s
@@ -715,15 +719,24 @@ def daemon():
         if len(frames) < 60:
             continue
 
-        def tail(seconds, q):
-            work = sorted(f[2] / 1e6 for f in frames if f[0] > now_ns - seconds * 1e9 and f[2] / 1e6 < LOADING_MS)
-            return work[min(len(work) - 1, int(len(work) * q))] if len(work) >= 10 else None
+        reach_ms = 1000 / (MIN_CAP * MARGIN)  # slowest work that still fits at the lowest cap
 
-        long_tail, short_tail = tail(TAIL_LONG, TAIL_LONG_Q), tail(TAIL_SHORT, TAIL_SHORT_Q)
+        def tail(seconds, q):
+            """(percentile q of work that a cap can absorb, fraction of frames beyond any cap's reach)"""
+            work = sorted(f[2] / 1e6 for f in frames if f[0] > now_ns - seconds * 1e9)
+            if len(work) < 10:
+                return None, 0.0
+            fits = [w for w in work if w <= reach_ms]
+            beyond = 1 - len(fits) / len(work)
+            if beyond > RARE_HITCH or not fits:
+                return float("inf"), beyond   # not rare hitches: the game is this heavy
+            return fits[min(len(fits) - 1, int(len(fits) * q))], beyond
+
+        (long_tail, long_beyond), (short_tail, _) = tail(TAIL_LONG, TAIL_LONG_Q), tail(TAIL_SHORT, TAIL_SHORT_Q)
         if long_tail is None:
             continue
         worst = max(long_tail, short_tail or 0)
-        target = max(MIN_CAP, min(max_cap(), int(1000 / (worst * MARGIN))))
+        target = MIN_CAP if worst == float("inf") else max(MIN_CAP, min(max_cap(), int(1000 / (worst * MARGIN))))
 
         late, backup = late_backup(frames)
         if backup is not None:
@@ -755,7 +768,8 @@ def daemon():
             tr.end_climb(cap, "reached the target")
         if new_cap is not None and new_cap != cap:
             if tr.climb is None:               # a drop: one line each
-                log(f"{cap} -> {new_cap}: {why}; p99/30s {long_tail:.1f} ms, p95/2s {short_tail or 0:.1f} ms, target {target}")
+                log(f"{cap} -> {new_cap}: {why}; p99/30s {long_tail:.1f} ms, p95/2s {short_tail or 0:.1f} ms, "
+                    f"{long_beyond:.1%} beyond reach, target {target}")
             tr.cap_changes.append((now_ns, cap, new_cap))
             changed_ns = now_ns
 

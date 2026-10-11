@@ -471,8 +471,14 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
   `work_ns` (window and percentile exist because crowds burst every 20-30 s) and, from the
   last 2 s, the 95th percentile (so walking into a crowd lowers the cap within a second or
   two). The worse of the two sets `target = 1000 / (worst_ms * MARGIN)`, clamped to
-  `MIN_CAP`..`MAX_CAP`. Frames with `work_ns` over 100 ms (loading) are excluded from the
-  tails. At least 60 frames in the window are needed.
+  `MIN_CAP`..`MAX_CAP`. At least 60 frames in the window are needed.
+- **Hitches no cap can absorb.** A frame whose work (with the margin) would not fit even at
+  `MIN_CAP` (19 ms at 50 fps) hitches at any cap, so lowering the cap does nothing for it.
+  As long as such frames are rare (at most 5% of the window) they are left out of the tails:
+  in World of Warcraft a few 37 ms spikes among 7.5 ms frames otherwise held the cap at the
+  minimum while 99% of frames needed under 9 ms. When more than 5% of frames are beyond
+  reach, they are not rare hitches but the game's actual load, and the target is `MIN_CAP`.
+  The log shows the share as "beyond reach".
 - **Moving the cap.** It lowers immediately to the target. Raising has two speeds. If the
   target is **10 fps or more** above the cap, it waits until the target has stayed above
   the cap for **2 s**, then climbs by +1 every **0.1 s** (50 to 120 takes about 9 s). Closer
@@ -499,7 +505,7 @@ compositor. Every 0.25 s it reads the new ring entries and decides:
 | Short tail | p95 over 2 s | fixed |
 | Rise, target 10+ fps above the cap | hold 2 s, +1 per 0.1 s | fixed |
 | Rise, closer | hold 5 s, +1 per 0.5 s | fixed |
-| Loading exclusion | 100 ms | fixed |
+| Rare hitches beyond reach (excluded from tails) | work × MARGIN > 1000 / MIN_CAP, up to 5% of frames | follows MIN_CAP and MARGIN |
 | Break gap / stall | 250 ms / 1 s | fixed |
 | Late-frame backup | >5% late, cap to 96% of achieved | fixed |
 | `last_adaptive` | p75 of the cap over 5 min of representative play, needs 30 s | fixed |
